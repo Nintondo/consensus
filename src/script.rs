@@ -212,13 +212,24 @@ struct TaprootSignatureParts {
     sighash_type: TapSighashType,
 }
 
-#[derive(Clone, Default)]
-struct ExecutionData {
-    annex: Option<Vec<u8>>,
+struct ExecutionData<'tx> {
+    annex: Option<Annex<'tx>>,
     tapleaf_hash: Option<TapLeafHash>,
     leaf_version: Option<u8>,
     code_separator_pos: Option<u32>,
     validation_weight_left: Option<i64>,
+}
+
+impl<'tx> Default for ExecutionData<'tx> {
+    fn default() -> Self {
+        Self {
+            annex: None,
+            tapleaf_hash: None,
+            leaf_version: None,
+            code_separator_pos: None,
+            validation_weight_left: None,
+        }
+    }
 }
 
 struct ControlBlock<'a> {
@@ -397,7 +408,7 @@ pub struct Interpreter<'tx, 'script> {
     sighash_cache: RefCell<SighashCache<&'tx Transaction>>,
     stack: ScriptStack,
     exec_stack: Vec<bool>,
-    exec_data: ExecutionData,
+    exec_data: ExecutionData<'tx>,
     last_error: ScriptError,
     op_count: usize,
     sigops: u32,
@@ -628,88 +639,113 @@ impl<'tx, 'script> Interpreter<'tx, 'script> {
         self.exec_stack.clear();
         self.op_count = 0;
         let script = ScriptBuf::from_bytes(script_bytes.to_vec());
-        let instruction_result = script.instruction_indices().collect::<Result<Vec<_>, _>>();
-        let instructions = match instruction_result {
-            Ok(instrs) => instrs,
-            Err(_) => return Err(self.fail(ScriptError::BadOpcode)),
-        };
+        let bytes = script.as_bytes();
         let mut altstack: Vec<Vec<u8>> = Vec::new();
         let mut code_separator = 0usize;
-        let script_len = script.as_bytes().len();
+        let mut cursor = 0usize;
+        let script_len = bytes.len();
 
-        for (idx, (position, instruction)) in instructions.iter().enumerate() {
+        while cursor < script_len {
+            let position = cursor;
+            let opcode = bytes[cursor];
+            cursor += 1;
             let should_execute = self.exec_stack.iter().all(|&cond| cond);
-            let next_pos = if idx + 1 < instructions.len() {
-                instructions[idx + 1].0
-            } else {
-                script_len
-            };
-            match instruction {
-                Instruction::Op(op) => {
-                    if matches!(*op, all::OP_VERIF | all::OP_VERNOTIF) {
-                        return Err(self.fail(ScriptError::BadOpcode));
-                    }
-                    if matches!(
-                        *op,
-                        all::OP_CAT
-                            | all::OP_SUBSTR
-                            | all::OP_LEFT
-                            | all::OP_RIGHT
-                            | all::OP_INVERT
-                            | all::OP_AND
-                            | all::OP_OR
-                            | all::OP_XOR
-                            | all::OP_2MUL
-                            | all::OP_2DIV
-                            | all::OP_MUL
-                            | all::OP_DIV
-                            | all::OP_MOD
-                            | all::OP_LSHIFT
-                            | all::OP_RSHIFT
-                    ) {
-                        return Err(self.fail(ScriptError::DisabledOpcode));
-                    }
-                    if op.to_u8() > all::OP_PUSHNUM_16.to_u8() {
-                        self.add_ops(1)?;
-                    }
-                    if is_control_flow(*op) {
-                        let control_res =
-                            self.handle_control_flow(stack, *op, should_execute, sigversion);
-                        self.track_script_error(control_res)?;
-                    } else if should_execute {
-                        if *op == all::OP_CODESEPARATOR {
-                            code_separator = next_pos;
-                            if sigversion == SigVersion::Taproot {
-                                self.exec_data.code_separator_pos = Some(*position as u32);
-                            }
-                        } else {
-                            let opcode_res = self.execute_opcode(
-                                stack,
-                                &mut altstack,
-                                *op,
-                                &script,
-                                code_separator,
-                                sigversion,
-                            );
-                            self.track_script_error(opcode_res)?;
-                        }
-                    }
+
+            if opcode >= 0x01 && opcode <= 0x4b {
+                let push_len = opcode as usize;
+                if cursor + push_len > script_len {
+                    return Err(self.fail(ScriptError::BadOpcode));
                 }
-                Instruction::PushBytes(bytes) => {
-                    if bytes.len() > MAX_SCRIPT_ELEMENT_SIZE {
-                        return Err(self.fail(ScriptError::PushSize));
-                    }
-                    if should_execute {
-                        if self.flags.bits() & VERIFY_MINIMALDATA != 0 {
-                            let opcode = script.as_bytes()[*position];
-                            if !is_minimal_push(opcode, bytes.as_bytes()) {
-                                return Err(self.fail(ScriptError::MinimalData));
-                            }
+                if push_len > MAX_SCRIPT_ELEMENT_SIZE {
+                    return Err(self.fail(ScriptError::PushSize));
+                }
+                if should_execute {
+                    if self.flags.bits() & VERIFY_MINIMALDATA != 0 {
+                        if !is_minimal_push(opcode, &bytes[cursor..cursor + push_len]) {
+                            return Err(self.fail(ScriptError::MinimalData));
                         }
-                        self.push_element(stack, bytes.as_bytes().to_vec())?;
+                    }
+                    self.push_element(stack, bytes[cursor..cursor + push_len].to_vec())?;
+                }
+                cursor += push_len;
+            } else if opcode == all::OP_PUSHDATA1.to_u8()
+                || opcode == all::OP_PUSHDATA2.to_u8()
+                || opcode == all::OP_PUSHDATA4.to_u8()
+            {
+                let width = match opcode {
+                    x if x == all::OP_PUSHDATA1.to_u8() => 1,
+                    x if x == all::OP_PUSHDATA2.to_u8() => 2,
+                    _ => 4,
+                };
+                let mut len_cursor = cursor;
+                let push_len = read_push_length(bytes, &mut len_cursor, width)
+                    .map_err(|err| self.fail(err))?;
+                if push_len > MAX_SCRIPT_ELEMENT_SIZE {
+                    return Err(self.fail(ScriptError::PushSize));
+                }
+                if len_cursor + push_len > script_len {
+                    return Err(self.fail(ScriptError::BadOpcode));
+                }
+                if should_execute {
+                    if self.flags.bits() & VERIFY_MINIMALDATA != 0 {
+                        if !is_minimal_push(opcode, &bytes[len_cursor..len_cursor + push_len]) {
+                            return Err(self.fail(ScriptError::MinimalData));
+                        }
+                    }
+                    self.push_element(
+                        stack,
+                        bytes[len_cursor..len_cursor + push_len].to_vec(),
+                    )?;
+                }
+                cursor = len_cursor + push_len;
+            } else {
+                let op = Opcode::from(opcode);
+
+                if matches!(op, all::OP_VERIF | all::OP_VERNOTIF) {
+                    return Err(self.fail(ScriptError::BadOpcode));
+                }
+                if matches!(
+                    op,
+                    all::OP_CAT
+                        | all::OP_SUBSTR
+                        | all::OP_LEFT
+                        | all::OP_RIGHT
+                        | all::OP_INVERT
+                        | all::OP_AND
+                        | all::OP_OR
+                        | all::OP_XOR
+                        | all::OP_2MUL
+                        | all::OP_2DIV
+                        | all::OP_MUL
+                        | all::OP_DIV
+                        | all::OP_MOD
+                        | all::OP_LSHIFT
+                        | all::OP_RSHIFT
+                ) {
+                    return Err(self.fail(ScriptError::DisabledOpcode));
+                }
+                if opcode > all::OP_PUSHNUM_16.to_u8() {
+                    self.add_ops(1)?;
+                }
+
+                if is_control_flow(op) {
+                    let control_res =
+                        self.handle_control_flow(stack, op, should_execute, sigversion);
+                    self.track_script_error(control_res)?;
+                } else if should_execute {
+                    if op == all::OP_CODESEPARATOR {
+                        code_separator = cursor;
+                        if sigversion == SigVersion::Taproot {
+                            self.exec_data.code_separator_pos = Some(position as u32);
+                        }
+                    } else {
+                        let opcode_res =
+                            self.execute_opcode(stack, &mut altstack, op, &script, code_separator, sigversion);
+                        self.track_script_error(opcode_res)?;
                     }
                 }
             }
+
             let limit_res = self.ensure_stack_limit(stack.len(), altstack.len());
             self.track_script_error(limit_res)?;
         }
@@ -1638,7 +1674,7 @@ impl<'tx, 'script> Interpreter<'tx, 'script> {
         &mut self,
         version: u8,
         program: &[u8],
-        witness: &Witness,
+        witness: &'tx Witness,
     ) -> Result<(), Error> {
         match version {
             0 => match program.len() {
@@ -1666,7 +1702,11 @@ impl<'tx, 'script> Interpreter<'tx, 'script> {
         }
     }
 
-    fn execute_taproot_program(&mut self, program: &[u8], witness: &Witness) -> Result<(), Error> {
+    fn execute_taproot_program(
+        &mut self,
+        program: &[u8],
+        witness: &'tx Witness,
+    ) -> Result<(), Error> {
         if self.flags.bits() & VERIFY_TAPROOT == 0 {
             return Ok(());
         }
@@ -1678,11 +1718,13 @@ impl<'tx, 'script> Interpreter<'tx, 'script> {
         self.exec_data = ExecutionData::default();
 
         let mut stack_len = witness.len();
-        let mut annex: Option<Vec<u8>> = None;
+        let mut annex: Option<Annex> = None;
         if stack_len >= 2 {
             let last = witness[stack_len - 1].as_ref();
             if !last.is_empty() && last[0] == TAPROOT_ANNEX_PREFIX {
-                annex = Some(last.to_vec());
+                annex = Some(
+                    Annex::new(last).map_err(|_| self.fail(ScriptError::WitnessProgramMismatch))?,
+                );
                 stack_len -= 1;
             }
         }
@@ -1936,15 +1978,7 @@ impl<'tx, 'script> Interpreter<'tx, 'script> {
             .as_ref()
             .ok_or(Error::ERR_SPENT_OUTPUTS_REQUIRED)?;
         let prevouts = Prevouts::All(spent_outputs.txouts());
-        let annex_bytes = self.exec_data.annex.as_deref();
-        let annex = if let Some(bytes) = annex_bytes {
-            match Annex::new(bytes) {
-                Ok(annex) => Some(annex),
-                Err(_) => return Err(self.fail(ScriptError::Unknown)),
-            }
-        } else {
-            None
-        };
+        let annex = self.exec_data.annex.clone();
 
         let sighash_res = {
             let mut cache = self.sighash_cache.borrow_mut();
