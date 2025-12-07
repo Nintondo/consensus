@@ -2,25 +2,23 @@ mod script_asm;
 
 use bitcoin::{
     absolute::LockTime,
-    blockdata::script::Builder,
+    blockdata::script::{Builder, PushBytesBuf},
     consensus as btc_consensus,
     hex::FromHex,
+    key::UntweakedPublicKey,
+    opcodes::all,
+    secp256k1::{Keypair, Secp256k1},
+    taproot::{LeafVersion, TaprootBuilder, TaprootSpendInfo},
     transaction::Version,
-    Amount,
-    OutPoint,
-    ScriptBuf,
-    Sequence,
-    Transaction,
-    TxIn,
-    TxOut,
-    Witness,
+    Amount, OutPoint, ScriptBuf, Sequence, Transaction, TxIn, TxOut, Witness,
 };
 use consensus::{
-    verify_with_flags_detailed, ScriptError, ScriptFailure, VERIFY_CHECKSEQUENCEVERIFY,
-    VERIFY_CLEANSTACK, VERIFY_DERSIG, VERIFY_DISCOURAGE_UPGRADABLE_NOPS,
+    verify_with_flags_detailed, ScriptError, ScriptFailure, Utxo, VERIFY_CHECKSEQUENCEVERIFY,
+    VERIFY_CLEANSTACK, VERIFY_DERSIG, VERIFY_DISCOURAGE_OP_SUCCESS,
+    VERIFY_DISCOURAGE_UPGRADABLE_NOPS, VERIFY_DISCOURAGE_UPGRADABLE_TAPROOT_VERSION,
     VERIFY_DISCOURAGE_UPGRADABLE_WITNESS_PROGRAM, VERIFY_LOW_S, VERIFY_MINIMALDATA,
     VERIFY_MINIMALIF, VERIFY_NULLDUMMY, VERIFY_NULLFAIL, VERIFY_P2SH, VERIFY_SIGPUSHONLY,
-    VERIFY_STRICTENC, VERIFY_WITNESS, VERIFY_WITNESS_PUBKEYTYPE,
+    VERIFY_STRICTENC, VERIFY_TAPROOT, VERIFY_WITNESS, VERIFY_WITNESS_PUBKEYTYPE,
 };
 use script_asm::{parse_script, ParseScriptError};
 use serde_json::Value;
@@ -44,12 +42,13 @@ fn bitcoin_core_script_vectors() {
             continue;
         }
 
+        let mut taproot_ctx = TaprootVectorContext::default();
         let mut position = 0usize;
         let mut witness = Witness::new();
         let mut amount = 0u64;
 
         if arr.get(position).map(|v| v.is_array()).unwrap_or(false) {
-            let (stack, sats) = parse_witness_and_amount(&arr[position])
+            let (stack, sats) = parse_witness_and_amount(&arr[position], &mut taproot_ctx)
                 .unwrap_or_else(|err| panic!("malformed witness entry #{index}: {err}"));
             witness = stack;
             amount = sats;
@@ -73,8 +72,8 @@ fn bitcoin_core_script_vectors() {
                 arr[position]
             )
         });
-        let script_pubkey = parse_script(script_pubkey_str)
-            .unwrap_or_else(|err| panic_parse(index, err, script_pubkey_str));
+        let script_pubkey = parse_script_with_placeholders(script_pubkey_str, &mut taproot_ctx)
+            .unwrap_or_else(|err| panic!("vector #{index} invalid scriptPubKey: {err}"));
         position += 1;
 
         let flags_str = arr[position]
@@ -193,10 +192,33 @@ fn run_vector_case(
 
     let tx_bytes = btc_consensus::serialize(&tx);
     if log_truncated_sig {
-        let hex = tx_bytes.iter().map(|b| format!("{:02x}", b)).collect::<String>();
+        let hex = tx_bytes
+            .iter()
+            .map(|b| format!("{:02x}", b))
+            .collect::<String>();
         eprintln!("debug tx bytes for truncated scriptSig: {hex}");
     }
-    verify_with_flags_detailed(script_pubkey.as_bytes(), amount, &tx_bytes, None, 0, flags)
+    let script_storage: Option<Vec<u8>> = if flags & VERIFY_TAPROOT != 0 {
+        Some(script_pubkey.as_bytes().to_vec())
+    } else {
+        None
+    };
+    let utxo_storage: Option<Vec<Utxo>> = script_storage.as_ref().map(|storage| {
+        vec![Utxo {
+            script_pubkey: storage.as_ptr(),
+            script_pubkey_len: storage.len() as u32,
+            value: amount as i64,
+        }]
+    });
+    let spent_slice = utxo_storage.as_deref();
+    verify_with_flags_detailed(
+        script_pubkey.as_bytes(),
+        amount,
+        &tx_bytes,
+        spent_slice,
+        0,
+        flags,
+    )
 }
 
 fn parse_flags(raw: &str) -> Result<u32, FlagError> {
@@ -211,6 +233,9 @@ fn parse_flags(raw: &str) -> Result<u32, FlagError> {
             "SIGPUSHONLY" => VERIFY_SIGPUSHONLY,
             "MINIMALDATA" => VERIFY_MINIMALDATA,
             "DISCOURAGE_UPGRADABLE_NOPS" => VERIFY_DISCOURAGE_UPGRADABLE_NOPS,
+            "DISCOURAGE_UPGRADABLE_TAPROOT_VERSION" => VERIFY_DISCOURAGE_UPGRADABLE_TAPROOT_VERSION,
+            "DISCOURAGE_OP_SUCCESS" => VERIFY_DISCOURAGE_OP_SUCCESS,
+            "TAPROOT" => VERIFY_TAPROOT,
             "CLEANSTACK" => VERIFY_CLEANSTACK,
             "CHECKSEQUENCEVERIFY" => VERIFY_CHECKSEQUENCEVERIFY,
             "WITNESS" => VERIFY_WITNESS,
@@ -238,7 +263,10 @@ impl fmt::Display for FlagError {
     }
 }
 
-fn parse_witness_and_amount(value: &Value) -> Result<(Witness, u64), String> {
+fn parse_witness_and_amount(
+    value: &Value,
+    taproot: &mut TaprootVectorContext,
+) -> Result<(Witness, u64), String> {
     let arr = value
         .as_array()
         .ok_or_else(|| "witness entry must be array".to_string())?;
@@ -248,14 +276,117 @@ fn parse_witness_and_amount(value: &Value) -> Result<(Witness, u64), String> {
 
     let mut stack = Vec::with_capacity(arr.len().saturating_sub(1));
     for item in &arr[..arr.len() - 1] {
-        let hex = item
+        let raw = item
             .as_str()
-            .ok_or_else(|| "witness stack entries must be strings".to_string())?;
-        let bytes = Vec::from_hex(hex).map_err(|_| "invalid witness hex".to_string())?;
-        stack.push(bytes);
+            .ok_or_else(|| "witness stack entries must be strings".to_string())?
+            .trim();
+        if let Some(script_asm) = raw.strip_prefix("#SCRIPT#") {
+            let script = parse_script(script_asm.trim())
+                .map_err(|err| format!("invalid taproot script witness: {err}"))?;
+            taproot.register_script(script.clone())?;
+            stack.push(script.as_bytes().to_vec());
+        } else if raw == "#CONTROLBLOCK#" {
+            let control = taproot.control_block_bytes()?;
+            stack.push(control);
+        } else {
+            let bytes = Vec::from_hex(raw).map_err(|_| "invalid witness hex".to_string())?;
+            stack.push(bytes);
+        }
     }
     let amount = amount_from_value(&arr[arr.len() - 1])?;
     Ok((Witness::from_slice(&stack), amount))
+}
+
+fn parse_script_with_placeholders(
+    raw: &str,
+    taproot: &mut TaprootVectorContext,
+) -> Result<ScriptBuf, String> {
+    if raw.trim() == "0x51 0x20 #TAPROOTOUTPUT#" {
+        taproot.taproot_output_script()
+    } else {
+        parse_script(raw).map_err(|err| err.to_string())
+    }
+}
+
+#[derive(Clone)]
+struct TaprootVectorContext {
+    builder: Option<TaprootBuilder>,
+    spend_info: Option<TaprootSpendInfo>,
+    last_script: Option<ScriptBuf>,
+    secp: Secp256k1<bitcoin::secp256k1::All>,
+    internal_key: UntweakedPublicKey,
+}
+
+impl Default for TaprootVectorContext {
+    fn default() -> Self {
+        const TAPROOT_KEY_BYTES: [u8; 32] = [
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 1,
+        ];
+        let secp = Secp256k1::new();
+        let keypair =
+            Keypair::from_seckey_slice(&secp, &TAPROOT_KEY_BYTES).expect("valid taproot key");
+        let (internal_key, _) = keypair.x_only_public_key();
+        Self {
+            builder: None,
+            spend_info: None,
+            last_script: None,
+            secp,
+            internal_key,
+        }
+    }
+}
+
+impl TaprootVectorContext {
+    fn register_script(&mut self, script: ScriptBuf) -> Result<(), String> {
+        if self.spend_info.is_some() {
+            return Err("taproot spend info already finalized".into());
+        }
+        let builder = self.builder.take().unwrap_or_else(TaprootBuilder::new);
+        let updated = builder
+            .add_leaf_with_ver(0, script.clone(), LeafVersion::TapScript)
+            .map_err(|err| format!("taproot builder error: {err}"))?;
+        self.builder = Some(updated);
+        self.last_script = Some(script);
+        Ok(())
+    }
+
+    fn control_block_bytes(&mut self) -> Result<Vec<u8>, String> {
+        let script = self
+            .last_script
+            .clone()
+            .ok_or_else(|| "taproot control block requested before script".to_string())?;
+        let info = self.ensure_spend_info()?;
+        let control = info
+            .control_block(&(script, LeafVersion::TapScript))
+            .ok_or_else(|| "failed to derive control block".to_string())?;
+        Ok(control.serialize())
+    }
+
+    fn taproot_output_script(&mut self) -> Result<ScriptBuf, String> {
+        let info = self.ensure_spend_info()?;
+        let program = info.output_key().to_x_only_public_key().serialize();
+        let push = PushBytesBuf::try_from(program.to_vec())
+            .map_err(|_| "taproot output key not 32 bytes".to_string())?;
+        Ok(Builder::new()
+            .push_opcode(all::OP_PUSHNUM_1)
+            .push_slice(push)
+            .into_script())
+    }
+
+    fn ensure_spend_info(&mut self) -> Result<&TaprootSpendInfo, String> {
+        if self.spend_info.is_none() {
+            let builder = self
+                .builder
+                .take()
+                .ok_or_else(|| "taproot builder missing tapscript leaf".to_string())?;
+            let spend = builder
+                .finalize(&self.secp, self.internal_key)
+                .map_err(|_| "taproot builder incomplete".to_string())?;
+            self.spend_info = Some(spend);
+        }
+        Ok(self.spend_info.as_ref().expect("spend info initialized"))
+    }
 }
 
 fn amount_from_value(value: &Value) -> Result<u64, String> {
@@ -364,6 +495,9 @@ fn parse_expected_error(raw: &str) -> Option<Option<ScriptError>> {
         "EQUALVERIFY" => EqualVerify,
         "DISCOURAGE_UPGRADABLE_NOPS" => DiscourageUpgradableNops,
         "DISCOURAGE_UPGRADABLE_WITNESS_PROGRAM" => DiscourageUpgradableWitnessProgram,
+        "DISCOURAGE_UPGRADABLE_TAPROOT_VERSION" => DiscourageUpgradableTaprootVersion,
+        "DISCOURAGE_OP_SUCCESS" => DiscourageOpSuccess,
+        "DISCOURAGE_UPGRADABLE_PUBKEYTYPE" => DiscourageUpgradablePubkeyType,
         "DISABLED_OPCODE" => DisabledOpcode,
         "BAD_OPCODE" => BadOpcode,
         "INVALID_STACK_OPERATION" => InvalidStackOperation,
@@ -388,6 +522,8 @@ fn parse_expected_error(raw: &str) -> Option<Option<ScriptError>> {
         "WITNESS_MALLEATED_P2SH" => WitnessMalleatedP2SH,
         "WITNESS_UNEXPECTED" => WitnessUnexpected,
         "WITNESS_PUBKEYTYPE" => WitnessPubkeyType,
+        "TAPSCRIPT_VALIDATION_WEIGHT" => TapscriptValidationWeight,
+        "TAPSCRIPT_CHECKMULTISIG" => TapscriptCheckMultiSig,
         _ => return None,
     };
     Some(Some(err))

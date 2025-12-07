@@ -233,7 +233,13 @@ fn is_native_taproot(script: &Script) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use bitcoin::{transaction::Version, Amount, OutPoint, ScriptBuf, TxIn, TxOut};
+    use crate::Utxo;
+    use bitcoin::{
+        blockdata::script::{Builder, PushBytesBuf},
+        opcodes::all,
+        transaction::Version,
+        Amount, OutPoint, ScriptBuf, TxIn, TxOut, Witness,
+    };
 
     #[test]
     fn parses_transaction_and_detects_hashes() {
@@ -278,5 +284,45 @@ mod tests {
         let spent = SpentOutputs::new(1, &[utxo]).expect("valid spent outputs");
         assert_eq!(spent.txouts().len(), 1);
         assert_eq!(spent.txouts()[0].value.to_sat(), 10);
+    }
+
+    #[test]
+    fn precomputed_marks_taproot_ready_when_prevouts_known() {
+        let taproot_script = Builder::new()
+            .push_opcode(all::OP_PUSHNUM_1)
+            .push_slice(PushBytesBuf::try_from(vec![0u8; 32]).unwrap())
+            .into_script();
+
+        let tx = Transaction {
+            version: Version(2),
+            lock_time: bitcoin::absolute::LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint::default(),
+                script_sig: ScriptBuf::new(),
+                sequence: bitcoin::Sequence::MAX,
+                witness: Witness::from(vec![vec![0x01]]),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(100),
+                script_pubkey: ScriptBuf::new(),
+            }],
+        };
+
+        let storage = taproot_script.as_bytes().to_vec();
+        let utxo = Utxo {
+            script_pubkey: storage.as_ptr(),
+            script_pubkey_len: storage.len() as u32,
+            value: 50,
+        };
+        let spent = SpentOutputs::new(1, &[utxo]).expect("spent outputs");
+        drop(storage);
+
+        let encoded = consensus::serialize(&tx);
+        let ctx = TransactionContext::parse(&encoded).expect("ctx");
+        let pre = ctx.build_precomputed(Some(&spent), false);
+        assert!(pre.bip341_taproot_ready);
+        assert!(pre.spent_amounts_single_hash.is_some());
+        assert!(pre.spent_scripts_single_hash.is_some());
+        assert!(!pre.bip143_segwit_ready);
     }
 }

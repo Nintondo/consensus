@@ -43,6 +43,12 @@ pub const VERIFY_MINIMALDATA: c_uint = 1 << 6;
 pub const VERIFY_DISCOURAGE_UPGRADABLE_NOPS: c_uint = 1 << 7;
 /// Discourage unknown witness program versions (policy flag used by Core's script tests).
 pub const VERIFY_DISCOURAGE_UPGRADABLE_WITNESS_PROGRAM: c_uint = 1 << 12;
+/// Discourage unknown Taproot leaf versions (policy flag used by Bitcoin Core's script tests).
+pub const VERIFY_DISCOURAGE_UPGRADABLE_TAPROOT_VERSION: c_uint = 1 << 18;
+/// Discourage unknown OP_SUCCESS opcodes inside tapscript (policy flag used by Bitcoin Core's script tests).
+pub const VERIFY_DISCOURAGE_OP_SUCCESS: c_uint = 1 << 19;
+/// Discourage unknown Taproot public key versions (policy flag used by Bitcoin Core's script tests).
+pub const VERIFY_DISCOURAGE_UPGRADABLE_PUBKEYTYPE: c_uint = 1 << 20;
 /// Require a clean stack after evaluation.
 pub const VERIFY_CLEANSTACK: c_uint = 1 << 8;
 /// Enable CHECKLOCKTIMEVERIFY (BIP65).
@@ -231,6 +237,20 @@ fn perform_verification(
             error: err,
             script_error: ScriptError::Ok,
         })?;
+    let mut derived_amount: Option<u64> = None;
+    if let Some(set) = spent_outputs.as_ref() {
+        let prevout = &set.txouts()[input_index];
+        if prevout.script_pubkey.as_bytes() != spent_output_script {
+            return Err(ScriptFailure {
+                error: Error::ERR_SPENT_OUTPUTS_MISMATCH,
+                script_error: ScriptError::Ok,
+            });
+        }
+        derived_amount = Some(prevout.value.to_sat());
+    }
+    let explicit_amount_known = true;
+    let amount = derived_amount.unwrap_or(amount);
+    let has_amount = derived_amount.is_some() || explicit_amount_known;
     let precomputed = tx_ctx.build_precomputed(spent_outputs.as_ref(), false);
     let mut interpreter = Interpreter::new(
         &tx_ctx,
@@ -239,7 +259,7 @@ fn perform_verification(
         spent_output_script,
         spent_outputs,
         amount,
-        true,
+        has_amount,
         flags,
     )
     .map_err(|err| ScriptFailure {
@@ -314,17 +334,24 @@ impl std::error::Error for Error {}
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::script::{Interpreter, ScriptFlags};
+    use crate::tx::SpentOutputs;
+    use crate::tx::TransactionContext;
+    use crate::Utxo;
     use bitcoin::{
         absolute::LockTime,
         blockdata::script::{Builder, PushBytesBuf, ScriptBuf},
-        consensus,
-        hashes::{sha256, Hash},
+        consensus::{self, Encodable},
+        hashes::{hash160, sha256, Hash, HashEngine},
         hex::FromHex,
+        key::{TapTweak, UntweakedPublicKey},
         opcodes::all,
         secp256k1::{
-            self, constants, ecdsa::Signature as EcdsaSignature, Message, Secp256k1, SecretKey,
+            self, constants, ecdsa::Signature as EcdsaSignature, Keypair, Message, Parity,
+            Secp256k1, SecretKey,
         },
-        sighash::{EcdsaSighashType, SegwitV0Sighash, SighashCache},
+        sighash::{EcdsaSighashType, Prevouts, SegwitV0Sighash, SighashCache, TapSighashType},
+        taproot::{TapLeafHash, TapNodeHash, TAPROOT_ANNEX_PREFIX, TAPROOT_LEAF_TAPSCRIPT},
         transaction::Version,
         Amount, OutPoint, Sequence, Transaction, TxIn, TxOut, Witness,
     };
@@ -930,6 +957,54 @@ mod tests {
     }
 
     #[test]
+    fn verify_nullfail_multisig_exhaustion() {
+        let secp = Secp256k1::new();
+        let sk1 = SecretKey::from_slice(&[11u8; 32]).unwrap();
+        let sk2 = SecretKey::from_slice(&[12u8; 32]).unwrap();
+        let pk1 = bitcoin::secp256k1::PublicKey::from_secret_key(&secp, &sk1);
+        let pk2 = bitcoin::secp256k1::PublicKey::from_secret_key(&secp, &sk2);
+
+        let spent_script = Builder::new()
+            .push_opcode(all::OP_PUSHNUM_2)
+            .push_slice(PushBytesBuf::try_from(pk1.serialize().to_vec()).unwrap())
+            .push_slice(PushBytesBuf::try_from(pk2.serialize().to_vec()).unwrap())
+            .push_opcode(all::OP_PUSHNUM_2)
+            .push_opcode(all::OP_CHECKMULTISIG)
+            .push_opcode(all::OP_NOT)
+            .into_script();
+
+        let tx = multisig_test_transaction();
+        let mut bad_sig1 = sign_input(&secp, &tx, &spent_script, &sk1);
+        corrupt_signature(&mut bad_sig1);
+        let mut bad_sig2 = sign_input(&secp, &tx, &spent_script, &sk2);
+        corrupt_signature(&mut bad_sig2);
+
+        let script_sig = Builder::new()
+            .push_opcode(all::OP_PUSHBYTES_0)
+            .push_slice(PushBytesBuf::try_from(bad_sig1).unwrap())
+            .push_slice(PushBytesBuf::try_from(bad_sig2).unwrap())
+            .into_script();
+
+        let mut tx = tx;
+        tx.input[0].script_sig = script_sig;
+        let tx_bytes = consensus::serialize(&tx);
+
+        verify_with_flags(spent_script.as_bytes(), 0, &tx_bytes, None, 0, VERIFY_NONE)
+            .expect("CHECKMULTISIG failure is masked by NOT when NULLFAIL disabled");
+
+        let failure = verify_with_flags_detailed(
+            spent_script.as_bytes(),
+            0,
+            &tx_bytes,
+            None,
+            0,
+            VERIFY_NULLFAIL,
+        )
+        .expect_err("NULLFAIL should trigger when failing non-empty multisig signatures remain");
+        assert_eq!(failure.script_error, ScriptError::NullFail);
+    }
+
+    #[test]
     fn verify_op_return_sets_script_error() {
         let script_sig = Builder::new().push_opcode(all::OP_PUSHNUM_1).into_script();
         let spent_script = Builder::new().push_opcode(all::OP_RETURN).into_script();
@@ -1353,6 +1428,550 @@ mod tests {
     }
 
     #[test]
+    fn spent_output_script_must_match() {
+        let spent_script = Builder::new().push_opcode(all::OP_PUSHNUM_1).into_script();
+        let wrong_script = Builder::new().push_opcode(all::OP_PUSHNUM_2).into_script();
+        let tx = multisig_test_transaction();
+        let tx_bytes = consensus::serialize(&tx);
+
+        let (storage, utxo) = make_utxo(&wrong_script, 0);
+        let utxos = [utxo];
+        let err = verify_with_flags(
+            spent_script.as_bytes(),
+            0,
+            &tx_bytes,
+            Some(&utxos),
+            0,
+            VERIFY_NONE,
+        )
+        .expect_err("mismatched spent output should fail");
+        assert_eq!(err, Error::ERR_SPENT_OUTPUTS_MISMATCH);
+        drop(storage);
+    }
+
+    #[test]
+    fn witness_amount_inferred_from_spent_outputs() {
+        let secp = Secp256k1::new();
+        let sk = SecretKey::from_slice(&[13u8; 32]).unwrap();
+        let pk = bitcoin::secp256k1::PublicKey::from_secret_key(&secp, &sk);
+        let pk_hash = hash160::Hash::hash(&pk.serialize());
+
+        let program = PushBytesBuf::try_from(pk_hash.to_byte_array().to_vec()).unwrap();
+        let spent_script = Builder::new()
+            .push_opcode(all::OP_PUSHBYTES_0)
+            .push_slice(program)
+            .into_script();
+
+        let mut tx = Transaction {
+            version: Version(2),
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint::default(),
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence::MAX,
+                witness: Witness::new(),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(0),
+                script_pubkey: ScriptBuf::new(),
+            }],
+        };
+
+        let script_code = Builder::new()
+            .push_opcode(all::OP_DUP)
+            .push_opcode(all::OP_HASH160)
+            .push_slice(
+                PushBytesBuf::try_from(pk_hash.to_byte_array().to_vec()).expect("pk hash push"),
+            )
+            .push_opcode(all::OP_EQUALVERIFY)
+            .push_opcode(all::OP_CHECKSIG)
+            .into_script();
+        let value = Amount::from_sat(75_000);
+        let sig = sign_witness_input(&secp, &tx, &script_code, value, &sk);
+        tx.input[0].witness = Witness::from(vec![sig, pk.serialize().to_vec()]);
+        let tx_bytes = consensus::serialize(&tx);
+
+        let (storage, utxo) = make_utxo(&spent_script, value.to_sat());
+        let utxos = [utxo];
+        verify_with_flags(
+            spent_script.as_bytes(),
+            0,
+            &tx_bytes,
+            Some(&utxos),
+            0,
+            VERIFY_WITNESS,
+        )
+        .expect("prevout amount inferred from spent outputs");
+        drop(storage);
+    }
+
+    #[test]
+    fn taproot_flag_requires_prevouts() {
+        let spent_script = Builder::new().push_opcode(all::OP_PUSHNUM_1).into_script();
+        let tx = multisig_test_transaction();
+        let tx_bytes = consensus::serialize(&tx);
+        let err = verify_with_flags(
+            spent_script.as_bytes(),
+            0,
+            &tx_bytes,
+            None,
+            0,
+            VERIFY_TAPROOT,
+        )
+        .expect_err("taproot without prevouts should fail");
+        assert_eq!(err, Error::ERR_SPENT_OUTPUTS_REQUIRED);
+    }
+
+    #[test]
+    fn taproot_script_path_succeeds() {
+        let script = Builder::new().push_opcode(all::OP_PUSHNUM_1).into_script();
+        let (spent_script, witness) =
+            taproot_script_fixture(TAPROOT_LEAF_TAPSCRIPT, script, Vec::new(), false);
+        run_taproot_verification(spent_script, witness, VERIFY_TAPROOT | VERIFY_CLEANSTACK)
+            .expect("basic tapscript executes");
+    }
+
+    #[test]
+    fn taproot_annex_is_hashed() {
+        let script = Builder::new().push_opcode(all::OP_PUSHNUM_1).into_script();
+        let (spent_script, witness) =
+            taproot_script_fixture(TAPROOT_LEAF_TAPSCRIPT, script, Vec::new(), true);
+        run_taproot_verification(spent_script, witness, VERIFY_TAPROOT)
+            .expect("annex-bearing witness allowed");
+    }
+
+    #[test]
+    fn taproot_control_length_checked() {
+        let script = Builder::new().push_opcode(all::OP_PUSHNUM_1).into_script();
+        let (spent_script, witness) =
+            taproot_script_fixture(TAPROOT_LEAF_TAPSCRIPT, script, Vec::new(), false);
+        let mut items: Vec<Vec<u8>> = witness.iter().map(|elem| elem.to_vec()).collect();
+        let control = items.last_mut().expect("control present");
+        control.pop();
+        let malformed = Witness::from(items);
+        let err = run_taproot_verification(spent_script, malformed, VERIFY_TAPROOT)
+            .expect_err("invalid control size rejected");
+        assert_eq!(err, ScriptError::TaprootWrongControlSize);
+    }
+
+    #[test]
+    fn taproot_future_leaf_discouraged() {
+        let future_version = TAPROOT_LEAF_TAPSCRIPT.wrapping_add(2);
+        let script = Builder::new().push_opcode(all::OP_PUSHNUM_1).into_script();
+        let (spent_script, witness) =
+            taproot_script_fixture(future_version, script, Vec::new(), false);
+        run_taproot_verification(spent_script.clone(), witness.clone(), VERIFY_TAPROOT)
+            .expect("future tapscript allowed when flag disabled");
+        let err = run_taproot_verification(
+            spent_script,
+            witness,
+            VERIFY_TAPROOT | VERIFY_DISCOURAGE_UPGRADABLE_TAPROOT_VERSION,
+        )
+        .expect_err("discourage flag should reject future leaf");
+        assert_eq!(err, ScriptError::DiscourageUpgradableTaprootVersion);
+    }
+
+    #[test]
+    fn taproot_empty_witness_rejected() {
+        let script = Builder::new().push_opcode(all::OP_PUSHNUM_1).into_script();
+        let (spent_script, _witness) =
+            taproot_script_fixture(TAPROOT_LEAF_TAPSCRIPT, script, Vec::new(), false);
+        let err = run_taproot_verification(spent_script, Witness::new(), VERIFY_TAPROOT)
+            .expect_err("empty taproot witness fails");
+        assert_eq!(err, ScriptError::WitnessProgramWitnessEmpty);
+    }
+
+    #[test]
+    fn taproot_checksig_verifies() {
+        let secp = Secp256k1::new();
+        let keypair = Keypair::from_seckey_slice(&secp, &[21u8; 32]).unwrap();
+        let (xonly, _) = keypair.x_only_public_key();
+        let script = Builder::new().push_opcode(all::OP_CHECKSIG).into_script();
+        let (spent_script, template) =
+            taproot_script_fixture(TAPROOT_LEAF_TAPSCRIPT, script.clone(), Vec::new(), false);
+        let amount = Amount::from_sat(50_000);
+        let sig = sign_tapscript_spend(&secp, &keypair, &script, &spent_script, amount);
+        let witness =
+            taproot_witness_from_template(vec![sig, xonly.serialize().to_vec()], &template);
+        run_taproot_verification(spent_script, witness, VERIFY_TAPROOT | VERIFY_CLEANSTACK)
+            .expect("valid tapscript signature executes");
+    }
+
+    #[test]
+    fn taproot_checksig_invalid_signature_fails_without_nullfail() {
+        let secp = Secp256k1::new();
+        let keypair = Keypair::from_seckey_slice(&secp, &[22u8; 32]).unwrap();
+        let (xonly, _) = keypair.x_only_public_key();
+        let script = Builder::new().push_opcode(all::OP_CHECKSIG).into_script();
+        let (spent_script, template) =
+            taproot_script_fixture(TAPROOT_LEAF_TAPSCRIPT, script.clone(), Vec::new(), false);
+        let amount = Amount::from_sat(50_000);
+        let mut sig = sign_tapscript_spend(&secp, &keypair, &script, &spent_script, amount);
+        sig[0] ^= 0x01;
+        let witness =
+            taproot_witness_from_template(vec![sig, xonly.serialize().to_vec()], &template);
+        let err = run_taproot_verification(
+            spent_script,
+            witness,
+            VERIFY_TAPROOT | VERIFY_CLEANSTACK | VERIFY_NULLFAIL,
+        )
+        .expect_err("invalid signature rejected");
+        assert_eq!(err, ScriptError::EvalFalse);
+    }
+
+    #[test]
+    fn taproot_checksigadd_succeeds() {
+        let secp = Secp256k1::new();
+        let keypair = Keypair::from_seckey_slice(&secp, &[23u8; 32]).unwrap();
+        let (xonly, _) = keypair.x_only_public_key();
+        let script = Builder::new()
+            .push_int(0)
+            .push_opcode(all::OP_SWAP)
+            .push_opcode(all::OP_CHECKSIGADD)
+            .push_opcode(all::OP_PUSHNUM_1)
+            .push_opcode(all::OP_EQUAL)
+            .into_script();
+        let (spent_script, template) =
+            taproot_script_fixture(TAPROOT_LEAF_TAPSCRIPT, script.clone(), Vec::new(), false);
+        let amount = Amount::from_sat(50_000);
+        let sig = sign_tapscript_spend(&secp, &keypair, &script, &spent_script, amount);
+        let witness =
+            taproot_witness_from_template(vec![sig, xonly.serialize().to_vec()], &template);
+        run_taproot_verification(spent_script, witness, VERIFY_TAPROOT | VERIFY_CLEANSTACK)
+            .expect("CHECKSIGADD satisfied");
+    }
+
+    #[test]
+    fn taproot_checksigadd_with_invalid_signature_fails() {
+        let secp = Secp256k1::new();
+        let keypair = Keypair::from_seckey_slice(&secp, &[24u8; 32]).unwrap();
+        let (xonly, _) = keypair.x_only_public_key();
+        let script = Builder::new()
+            .push_int(0)
+            .push_opcode(all::OP_SWAP)
+            .push_opcode(all::OP_CHECKSIGADD)
+            .push_opcode(all::OP_PUSHNUM_1)
+            .push_opcode(all::OP_EQUAL)
+            .into_script();
+        let (spent_script, template) =
+            taproot_script_fixture(TAPROOT_LEAF_TAPSCRIPT, script, Vec::new(), false);
+        let witness =
+            taproot_witness_from_template(vec![Vec::new(), xonly.serialize().to_vec()], &template);
+        let err = run_taproot_verification(
+            spent_script,
+            witness,
+            VERIFY_TAPROOT | VERIFY_CLEANSTACK | VERIFY_NULLFAIL,
+        )
+        .expect_err("empty signature rejected");
+        assert_eq!(err, ScriptError::EvalFalse);
+    }
+
+    #[test]
+    fn taproot_multi_a_checksigadd_pattern() {
+        let secp = Secp256k1::new();
+        let secrets = [[25u8; 32], [26u8; 32], [27u8; 32]];
+        let mut builder = Builder::new();
+        // Mirror Bitcoin Core's multi_a descriptor script:
+        // key0 CHECKSIG, subsequent keys CHECKSIGADD, final threshold via NUMEQUAL.
+        for (index, secret) in secrets.iter().enumerate() {
+            let keypair = Keypair::from_seckey_slice(&secp, secret).unwrap();
+            let (xonly, _) = keypair.x_only_public_key();
+            let push = PushBytesBuf::try_from(xonly.serialize().to_vec()).unwrap();
+            builder = builder.push_slice(push);
+            if index == 0 {
+                builder = builder.push_opcode(all::OP_CHECKSIG);
+            } else {
+                builder = builder.push_opcode(all::OP_CHECKSIGADD);
+            }
+        }
+        builder = builder.push_int(2).push_opcode(all::OP_NUMEQUAL);
+        let script = builder.into_script();
+        let (spent_script, template) =
+            taproot_script_fixture(TAPROOT_LEAF_TAPSCRIPT, script.clone(), Vec::new(), false);
+        let amount = Amount::from_sat(50_000);
+        let signatures: Vec<Vec<u8>> = secrets
+            .iter()
+            .map(|secret| {
+                let keypair = Keypair::from_seckey_slice(&secp, secret).unwrap();
+                sign_tapscript_spend(&secp, &keypair, &script, &spent_script, amount)
+            })
+            .collect();
+
+        let satisfied_stack = vec![
+            signatures[2].clone(),
+            Vec::new(),
+            signatures[0].clone(),
+        ];
+        let witness = taproot_witness_from_template(satisfied_stack, &template);
+        run_taproot_verification(
+            spent_script.clone(),
+            witness,
+            VERIFY_TAPROOT | VERIFY_CLEANSTACK,
+        )
+        .expect("2-of-3 CHECKSIGADD pattern matches Core's multi_a flow");
+
+        let unsatisfied_stack = vec![Vec::new(), Vec::new(), signatures[0].clone()];
+        let witness = taproot_witness_from_template(unsatisfied_stack, &template);
+        let err = run_taproot_verification(
+            spent_script,
+            witness,
+            VERIFY_TAPROOT | VERIFY_CLEANSTACK,
+        )
+        .expect_err("threshold unmet should fail");
+        assert_eq!(err, ScriptError::EvalFalse);
+    }
+
+    #[test]
+    fn taproot_op_success_short_circuits() {
+        let script = ScriptBuf::from_bytes(vec![0x50]);
+        let (spent_script, template) =
+            taproot_script_fixture(TAPROOT_LEAF_TAPSCRIPT, script, Vec::new(), false);
+        let witness = taproot_witness_from_template(vec![vec![0x01]], &template);
+        run_taproot_verification(spent_script, witness, VERIFY_TAPROOT)
+            .expect("op_success short-circuits execution");
+    }
+
+    #[test]
+    fn taproot_op_success_discouraged_errors() {
+        let script = ScriptBuf::from_bytes(vec![0x50]);
+        let (spent_script, template) =
+            taproot_script_fixture(TAPROOT_LEAF_TAPSCRIPT, script, Vec::new(), false);
+        let witness = taproot_witness_from_template(vec![vec![0x01]], &template);
+        let err = run_taproot_verification(
+            spent_script,
+            witness,
+            VERIFY_TAPROOT | VERIFY_DISCOURAGE_OP_SUCCESS,
+        )
+        .expect_err("discourage op_success flag should fail");
+        assert_eq!(err, ScriptError::DiscourageOpSuccess);
+    }
+
+    #[test]
+    fn taproot_checkmultisig_disallowed() {
+        let script = Builder::new()
+            .push_opcode(all::OP_CHECKMULTISIG)
+            .into_script();
+        let (spent_script, template) =
+            taproot_script_fixture(TAPROOT_LEAF_TAPSCRIPT, script, Vec::new(), false);
+        let witness = taproot_witness_from_template(Vec::new(), &template);
+        let err = run_taproot_verification(spent_script, witness, VERIFY_TAPROOT)
+            .expect_err("tapscript CHECKMULTISIG is forbidden");
+        assert_eq!(err, ScriptError::TapscriptCheckMultiSig);
+    }
+
+    #[test]
+    fn taproot_minimal_if_enforced_without_flag() {
+        let script = Builder::new()
+            .push_slice(PushBytesBuf::try_from(vec![0x02]).unwrap())
+            .push_opcode(all::OP_IF)
+            .push_opcode(all::OP_PUSHNUM_1)
+            .push_opcode(all::OP_ENDIF)
+            .into_script();
+        let (spent_script, template) =
+            taproot_script_fixture(TAPROOT_LEAF_TAPSCRIPT, script, Vec::new(), false);
+        let witness = taproot_witness_from_template(Vec::new(), &template);
+        let err = run_taproot_verification(spent_script, witness, VERIFY_TAPROOT)
+            .expect_err("tapscript enforces minimal-if regardless of flags");
+        assert_eq!(err, ScriptError::MinimalIf);
+    }
+
+    #[test]
+    fn taproot_discourage_upgradable_pubkeytype() {
+        let script = Builder::new().push_opcode(all::OP_CHECKSIG).into_script();
+        let (spent_script, template) =
+            taproot_script_fixture(TAPROOT_LEAF_TAPSCRIPT, script, Vec::new(), false);
+        let sig = vec![0x01];
+        let mut stack_items = Vec::with_capacity(2);
+        stack_items.push(sig.clone());
+        stack_items.push(vec![0x02; 33]);
+        let witness = taproot_witness_from_template(stack_items, &template);
+        run_taproot_verification(spent_script.clone(), witness.clone(), VERIFY_TAPROOT)
+            .expect("unknown pubkey type permitted without flag");
+        let err = run_taproot_verification(
+            spent_script,
+            witness,
+            VERIFY_TAPROOT | VERIFY_DISCOURAGE_UPGRADABLE_PUBKEYTYPE,
+        )
+        .expect_err("discourage flag rejects unknown pubkey version");
+        assert_eq!(err, ScriptError::DiscourageUpgradablePubkeyType);
+    }
+
+    fn taproot_script_fixture(
+        leaf_version: u8,
+        script: ScriptBuf,
+        mut stack_items: Vec<Vec<u8>>,
+        include_annex: bool,
+    ) -> (ScriptBuf, Witness) {
+        let internal_key_bytes =
+            Vec::from_hex("79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798")
+                .expect("generator x");
+        let internal_key = UntweakedPublicKey::from_slice(&internal_key_bytes).unwrap();
+        let secp = Secp256k1::verification_only();
+
+        let mut engine = TapLeafHash::engine();
+        engine.input(&[leaf_version]);
+        script
+            .consensus_encode(&mut engine)
+            .expect("script serialize");
+        let tapleaf_hash = TapLeafHash::from_engine(engine);
+        let merkle_root = TapNodeHash::from(tapleaf_hash);
+        let (tweaked, parity) = internal_key.tap_tweak(&secp, Some(merkle_root));
+        let parity_bit = match parity {
+            Parity::Even => 0,
+            Parity::Odd => 1,
+        };
+
+        let mut control = Vec::with_capacity(33);
+        control.push(leaf_version | parity_bit);
+        control.extend_from_slice(&internal_key.serialize());
+
+        stack_items.push(script.as_bytes().to_vec());
+        stack_items.push(control);
+        if include_annex {
+            stack_items.push(vec![TAPROOT_ANNEX_PREFIX, 0x01]);
+        }
+        let witness = Witness::from(stack_items);
+
+        let program = tweaked.to_x_only_public_key().serialize();
+        let program_push = PushBytesBuf::try_from(program.to_vec()).unwrap();
+        let spent_script = Builder::new()
+            .push_opcode(all::OP_PUSHNUM_1)
+            .push_slice(program_push)
+            .into_script();
+
+        (spent_script, witness)
+    }
+
+    fn tapscript_leaf_hash(script: &ScriptBuf, leaf_version: u8) -> TapLeafHash {
+        let mut engine = TapLeafHash::engine();
+        engine.input(&[leaf_version]);
+        script
+            .consensus_encode(&mut engine)
+            .expect("script serialization");
+        TapLeafHash::from_engine(engine)
+    }
+
+    fn taproot_witness_from_template(mut stack_items: Vec<Vec<u8>>, template: &Witness) -> Witness {
+        let mut items: Vec<Vec<u8>> = template.iter().map(|elem| elem.to_vec()).collect();
+        let annex = if let Some(last) = items.last() {
+            if !last.is_empty() && last[0] == TAPROOT_ANNEX_PREFIX {
+                Some(items.pop().expect("annex present"))
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        let control = items.pop().expect("control block");
+        let script_bytes = items.pop().expect("witness script");
+        assert!(items.is_empty(), "template should not contain stack items");
+        stack_items.push(script_bytes);
+        stack_items.push(control);
+        if let Some(annex_bytes) = annex {
+            stack_items.push(annex_bytes);
+        }
+        Witness::from(stack_items)
+    }
+
+    fn taproot_test_transaction(amount: Amount) -> Transaction {
+        Transaction {
+            version: Version(2),
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint::default(),
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence::MAX,
+                witness: Witness::new(),
+            }],
+            output: vec![TxOut {
+                value: amount,
+                script_pubkey: ScriptBuf::new(),
+            }],
+        }
+    }
+
+    fn sign_tapscript_spend(
+        secp: &Secp256k1<secp256k1::All>,
+        keypair: &Keypair,
+        script: &ScriptBuf,
+        spent_script: &ScriptBuf,
+        amount: Amount,
+    ) -> Vec<u8> {
+        let tapleaf_hash = tapscript_leaf_hash(script, TAPROOT_LEAF_TAPSCRIPT);
+        let tx = taproot_test_transaction(amount);
+        let mut cache = SighashCache::new(&tx);
+        let prevout = TxOut {
+            value: amount,
+            script_pubkey: spent_script.clone(),
+        };
+        let prevouts = vec![prevout];
+        let sighash = cache
+            .taproot_signature_hash(
+                0,
+                &Prevouts::All(prevouts.as_slice()),
+                None,
+                Some((tapleaf_hash, u32::MAX)),
+                TapSighashType::Default,
+            )
+            .expect("taproot sighash");
+        let message = Message::from(sighash);
+        let signature = secp.sign_schnorr_no_aux_rand(&message, keypair);
+        signature.as_ref().to_vec()
+    }
+
+    fn run_taproot_verification(
+        spent_script: ScriptBuf,
+        witness: Witness,
+        flags: u32,
+    ) -> Result<(), ScriptError> {
+        let amount = Amount::from_sat(50_000);
+        let tx = Transaction {
+            version: Version(2),
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint::default(),
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence::MAX,
+                witness,
+            }],
+            output: vec![TxOut {
+                value: amount,
+                script_pubkey: ScriptBuf::new(),
+            }],
+        };
+
+        let tx_bytes = consensus::serialize(&tx);
+        let tx_ctx = TransactionContext::parse(&tx_bytes).unwrap();
+        let script_storage = spent_script.as_bytes().to_vec();
+        let utxo = Utxo {
+            script_pubkey: script_storage.as_ptr(),
+            script_pubkey_len: script_storage.len() as u32,
+            value: amount.to_sat() as i64,
+        };
+        let utxos = [utxo];
+        let spent_outputs = SpentOutputs::new(1, &utxos).unwrap();
+        let script_flags = ScriptFlags::from_bits(flags).unwrap();
+        let precomputed = tx_ctx.build_precomputed(Some(&spent_outputs), false);
+        let mut interpreter = Interpreter::new(
+            &tx_ctx,
+            precomputed,
+            0,
+            spent_script.as_bytes(),
+            Some(spent_outputs),
+            amount.to_sat(),
+            true,
+            script_flags,
+        )
+        .unwrap();
+
+        match interpreter.verify() {
+            Ok(()) => Ok(()),
+            Err(Error::ERR_SCRIPT) => Err(interpreter.last_script_error()),
+            Err(other) => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    #[test]
     fn verify_codesep_affects_sighash() {
         let secp = Secp256k1::new();
         let sk = SecretKey::from_slice(&[1u8; 32]).unwrap();
@@ -1750,5 +2369,15 @@ mod tests {
             let idx = sig.len() - 3;
             sig[idx] ^= 0x01;
         }
+    }
+
+    fn make_utxo(script: &ScriptBuf, value: u64) -> (Vec<u8>, Utxo) {
+        let bytes = script.as_bytes().to_vec();
+        let utxo = Utxo {
+            script_pubkey: bytes.as_ptr(),
+            script_pubkey_len: bytes.len() as u32,
+            value: value as i64,
+        };
+        (bytes, utxo)
     }
 }

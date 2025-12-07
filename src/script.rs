@@ -15,21 +15,32 @@ use bitcoin::{
     absolute::LOCK_TIME_THRESHOLD,
     blockdata::script::{Instruction, PushBytesBuf, Script, ScriptBuf},
     blockdata::transaction::Sequence,
-    hashes::{hash160, ripemd160, sha1, sha256, sha256d, Hash},
+    consensus::{self, Encodable},
+    hashes::{hash160, ripemd160, sha1, sha256, sha256d, Hash, HashEngine},
+    key::{TapTweak, UntweakedPublicKey},
     opcodes::{all, Opcode},
     script::Builder,
-    secp256k1::{ecdsa::Signature as EcdsaSignature, Message, PublicKey, Secp256k1},
-    sighash::{EcdsaSighashType, SegwitV0Sighash, SighashCache},
+    secp256k1::{
+        ecdsa::Signature as EcdsaSignature, schnorr::Signature as SchnorrSignature, Message,
+        Parity, PublicKey, Secp256k1, XOnlyPublicKey,
+    },
+    sighash::{Annex, EcdsaSighashType, Prevouts, SegwitV0Sighash, SighashCache, TapSighashType},
+    taproot::{
+        TapLeafHash, TapNodeHash, TAPROOT_ANNEX_PREFIX, TAPROOT_CONTROL_BASE_SIZE,
+        TAPROOT_CONTROL_MAX_SIZE, TAPROOT_CONTROL_NODE_SIZE, TAPROOT_LEAF_MASK,
+        TAPROOT_LEAF_TAPSCRIPT,
+    },
     Amount, Witness,
 };
 
 use crate::{
     tx::{PrecomputedTransactionData, SpentOutputs, TransactionContext},
     Error, VERIFY_CHECKLOCKTIMEVERIFY, VERIFY_CHECKSEQUENCEVERIFY, VERIFY_CLEANSTACK,
-    VERIFY_DERSIG, VERIFY_DISCOURAGE_UPGRADABLE_NOPS, VERIFY_DISCOURAGE_UPGRADABLE_WITNESS_PROGRAM,
-    VERIFY_LOW_S, VERIFY_MINIMALDATA, VERIFY_MINIMALIF, VERIFY_NULLDUMMY, VERIFY_NULLFAIL,
-    VERIFY_P2SH, VERIFY_SIGPUSHONLY, VERIFY_STRICTENC, VERIFY_TAPROOT, VERIFY_WITNESS,
-    VERIFY_WITNESS_PUBKEYTYPE,
+    VERIFY_DERSIG, VERIFY_DISCOURAGE_OP_SUCCESS, VERIFY_DISCOURAGE_UPGRADABLE_NOPS,
+    VERIFY_DISCOURAGE_UPGRADABLE_PUBKEYTYPE, VERIFY_DISCOURAGE_UPGRADABLE_TAPROOT_VERSION,
+    VERIFY_DISCOURAGE_UPGRADABLE_WITNESS_PROGRAM, VERIFY_LOW_S, VERIFY_MINIMALDATA,
+    VERIFY_MINIMALIF, VERIFY_NULLDUMMY, VERIFY_NULLFAIL, VERIFY_P2SH, VERIFY_SIGPUSHONLY,
+    VERIFY_STRICTENC, VERIFY_TAPROOT, VERIFY_WITNESS, VERIFY_WITNESS_PUBKEYTYPE,
 };
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
@@ -68,6 +79,9 @@ pub enum ScriptError {
     NullFail,
     DiscourageUpgradableNops,
     DiscourageUpgradableWitnessProgram,
+    DiscourageUpgradableTaprootVersion,
+    DiscourageOpSuccess,
+    DiscourageUpgradablePubkeyType,
     WitnessProgramWrongLength,
     WitnessProgramWitnessEmpty,
     WitnessProgramMismatch,
@@ -75,6 +89,12 @@ pub enum ScriptError {
     WitnessMalleatedP2SH,
     WitnessUnexpected,
     WitnessPubkeyType,
+    SchnorrSigSize,
+    SchnorrSigHashType,
+    SchnorrSig,
+    TaprootWrongControlSize,
+    TapscriptValidationWeight,
+    TapscriptCheckMultiSig,
     SigFindAndDelete,
 }
 
@@ -90,6 +110,9 @@ const SUPPORTED_FLAGS: u32 = VERIFY_P2SH
     | VERIFY_TAPROOT
     | VERIFY_MINIMALDATA
     | VERIFY_DISCOURAGE_UPGRADABLE_NOPS
+    | VERIFY_DISCOURAGE_OP_SUCCESS
+    | VERIFY_DISCOURAGE_UPGRADABLE_PUBKEYTYPE
+    | VERIFY_DISCOURAGE_UPGRADABLE_TAPROOT_VERSION
     | VERIFY_DISCOURAGE_UPGRADABLE_WITNESS_PROGRAM
     | VERIFY_CLEANSTACK
     | VERIFY_MINIMALIF
@@ -107,6 +130,8 @@ const SEQUENCE_LOCKTIME_DISABLE_FLAG: u32 = 1 << 31;
 const SEQUENCE_LOCKTIME_TYPE_FLAG: u32 = 1 << 22;
 const SEQUENCE_LOCKTIME_MASK: u32 = 0x0000ffff;
 const SEQUENCE_LOCKTIME_GRANULARITY: u32 = 9;
+const VALIDATION_WEIGHT_PER_SIGOP_PASSED: i64 = 50;
+const VALIDATION_WEIGHT_OFFSET: i64 = 50;
 
 /// Wrapper for script verification flags.
 #[derive(Debug, Clone, Copy)]
@@ -117,7 +142,7 @@ impl ScriptFlags {
         if bits & !SUPPORTED_FLAGS != 0 {
             return Err(Error::ERR_INVALID_FLAGS);
         }
-        Ok(Self(bits))
+        Ok(Self(Self::apply_implied_bits(bits)))
     }
 
     pub fn bits(self) -> u32 {
@@ -127,18 +152,44 @@ impl ScriptFlags {
     pub fn requires_spent_outputs(self) -> bool {
         self.0 & VERIFY_TAPROOT != 0
     }
+
+    fn apply_implied_bits(mut bits: u32) -> u32 {
+        if bits & VERIFY_TAPROOT != 0 {
+            bits |= VERIFY_WITNESS;
+        }
+        if bits & VERIFY_WITNESS != 0 {
+            bits |= VERIFY_P2SH;
+        }
+        bits
+    }
 }
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 enum SigVersion {
     Base,
     WitnessV0,
+    Taproot,
 }
 
 #[derive(Clone, Copy)]
 struct SignatureParts {
     signature: EcdsaSignature,
     sighash_type: u32,
+}
+
+#[derive(Clone, Copy)]
+struct TaprootSignatureParts {
+    signature: SchnorrSignature,
+    sighash_type: TapSighashType,
+}
+
+#[derive(Clone, Default)]
+struct ExecutionData {
+    annex: Option<Vec<u8>>,
+    tapleaf_hash: Option<TapLeafHash>,
+    leaf_version: Option<u8>,
+    code_separator_pos: Option<u32>,
+    validation_weight_left: Option<i64>,
 }
 
 /// Minimal stack abstraction used by the interpreter.
@@ -228,6 +279,7 @@ pub struct Interpreter<'tx, 'script> {
     input_index: usize,
     stack: ScriptStack,
     exec_stack: Vec<bool>,
+    exec_data: ExecutionData,
     last_error: ScriptError,
     op_count: usize,
     sigops: u32,
@@ -260,6 +312,7 @@ impl<'tx, 'script> Interpreter<'tx, 'script> {
             input_index,
             stack: ScriptStack::new(),
             exec_stack: Vec::new(),
+            exec_data: ExecutionData::default(),
             last_error: ScriptError::Ok,
             op_count: 0,
             sigops: 0,
@@ -274,6 +327,7 @@ impl<'tx, 'script> Interpreter<'tx, 'script> {
 
         self.last_error = ScriptError::Ok;
         self.had_witness = false;
+        self.exec_data = ExecutionData::default();
         let txin = &self.tx_ctx.tx().input[self.input_index];
         if txin.script_sig.as_bytes() == [0x4c, 0x01] {
             eprintln!(
@@ -476,8 +530,7 @@ impl<'tx, 'script> Interpreter<'tx, 'script> {
             };
             match instruction {
                 Instruction::Op(op) => {
-                    if matches!(*op, all::OP_VERIF | all::OP_VERNOTIF)
-                    {
+                    if matches!(*op, all::OP_VERIF | all::OP_VERNOTIF) {
                         return Err(self.fail(ScriptError::BadOpcode));
                     }
                     if matches!(
@@ -510,6 +563,9 @@ impl<'tx, 'script> Interpreter<'tx, 'script> {
                     } else if should_execute {
                         if *op == all::OP_CODESEPARATOR {
                             code_separator = next_pos;
+                            if sigversion == SigVersion::Taproot {
+                                self.exec_data.code_separator_pos = Some(*position as u32);
+                            }
                         } else {
                             let opcode_res = self.execute_opcode(
                                 stack,
@@ -575,7 +631,10 @@ impl<'tx, 'script> Interpreter<'tx, 'script> {
         let opcode = op.to_u8();
         let require_minimal = self.flags.bits() & VERIFY_MINIMALDATA != 0;
 
-        if matches!(op, OP_RESERVED | OP_RESERVED1 | OP_RESERVED2 | OP_VER | OP_INVALIDOPCODE) {
+        if matches!(
+            op,
+            OP_RESERVED | OP_RESERVED1 | OP_RESERVED2 | OP_VER | OP_INVALIDOPCODE
+        ) {
             return Err(self.fail(ScriptError::BadOpcode));
         }
 
@@ -942,6 +1001,9 @@ impl<'tx, 'script> Interpreter<'tx, 'script> {
                 self.op_checksig(stack, script, code_separator, sigversion)?;
                 self.op_verify_with_code(stack, ScriptError::CheckSigVerify)?;
             }
+            OP_CHECKSIGADD => {
+                self.op_checksigadd(stack, sigversion)?;
+            }
             OP_CHECKMULTISIG => {
                 self.op_checkmultisig(stack, script, code_separator, sigversion)?;
             }
@@ -970,8 +1032,12 @@ impl<'tx, 'script> Interpreter<'tx, 'script> {
                 if should_execute {
                     let condition =
                         self.map_failure(stack.pop_bytes(), ScriptError::UnbalancedConditional)?;
-                    if sigversion == SigVersion::WitnessV0
-                        && self.flags.bits() & VERIFY_MINIMALIF != 0
+                    let enforce_minimal_if = match sigversion {
+                        SigVersion::WitnessV0 => self.flags.bits() & VERIFY_MINIMALIF != 0,
+                        SigVersion::Taproot => true,
+                        SigVersion::Base => false,
+                    };
+                    if enforce_minimal_if
                         && !condition.is_empty()
                         && !is_minimal_if_condition(&condition)
                     {
@@ -1070,13 +1136,20 @@ impl<'tx, 'script> Interpreter<'tx, 'script> {
     ) -> Result<(), Error> {
         let pubkey = self.map_failure(stack.pop_bytes(), ScriptError::InvalidStackOperation)?;
         let sig = self.map_failure(stack.pop_bytes(), ScriptError::InvalidStackOperation)?;
-        let sig_parts = self.parse_signature(&sig, sigversion)?;
-        self.check_pubkey_encoding(&pubkey, sigversion)?;
-
-        let script_code = self.build_script_code(script, code_separator)?;
-        let result =
-            self.verify_ecdsa_signature(sig_parts, &pubkey, &script_code, sigversion, &sig)?;
-        if !result && self.flags.bits() & VERIFY_NULLFAIL != 0 && !sig.is_empty() {
+        let result = match sigversion {
+            SigVersion::Taproot => self.verify_tapscript_signature(&sig, &pubkey)?,
+            _ => {
+                let sig_parts = self.parse_signature(&sig, sigversion)?;
+                self.check_pubkey_encoding(&pubkey, sigversion)?;
+                let script_code = self.build_script_code(script, code_separator)?;
+                self.verify_ecdsa_signature(sig_parts, &pubkey, &script_code, sigversion, &sig)?
+            }
+        };
+        if sigversion != SigVersion::Taproot
+            && !result
+            && self.flags.bits() & VERIFY_NULLFAIL != 0
+            && !sig.is_empty()
+        {
             return Err(self.fail(ScriptError::NullFail));
         }
         self.push_bool_element(stack, result)
@@ -1089,6 +1162,9 @@ impl<'tx, 'script> Interpreter<'tx, 'script> {
         code_separator: usize,
         sigversion: SigVersion,
     ) -> Result<(), Error> {
+        if sigversion == SigVersion::Taproot {
+            return Err(self.fail(ScriptError::TapscriptCheckMultiSig));
+        }
         let require_minimal = self.flags.bits() & VERIFY_MINIMALDATA != 0;
         let n_keys = self.pop_scriptnum(stack, require_minimal, SCRIPTNUM_MAX_LEN)?;
         if n_keys < 0 || n_keys as usize > MAX_PUBKEYS_PER_MULTISIG {
@@ -1170,6 +1246,27 @@ impl<'tx, 'script> Interpreter<'tx, 'script> {
         }
 
         self.push_bool_element(stack, success)
+    }
+
+    fn op_checksigadd(
+        &mut self,
+        stack: &mut ScriptStack,
+        sigversion: SigVersion,
+    ) -> Result<(), Error> {
+        if sigversion != SigVersion::Taproot {
+            return Err(self.fail(ScriptError::BadOpcode));
+        }
+        if stack.len() < 3 {
+            return Err(self.fail(ScriptError::InvalidStackOperation));
+        }
+
+        let pubkey = self.map_failure(stack.pop_bytes(), ScriptError::InvalidStackOperation)?;
+        let require_minimal = self.flags.bits() & VERIFY_MINIMALDATA != 0;
+        let value = self.pop_scriptnum(stack, require_minimal, SCRIPTNUM_MAX_LEN)?;
+        let sig = self.map_failure(stack.pop_bytes(), ScriptError::InvalidStackOperation)?;
+        let sig_valid = self.verify_tapscript_signature(&sig, &pubkey)?;
+        let result = value + if sig_valid { 1 } else { 0 };
+        self.push_element(stack, encode_num(result))
     }
 
     fn pop_scriptnum(
@@ -1319,6 +1416,51 @@ impl<'tx, 'script> Interpreter<'tx, 'script> {
         }))
     }
 
+    fn parse_taproot_signature(
+        &mut self,
+        sig_with_hashtype: &[u8],
+    ) -> Result<Option<TaprootSignatureParts>, Error> {
+        if sig_with_hashtype.is_empty() {
+            return Ok(None);
+        }
+        if sig_with_hashtype.len() != 64 && sig_with_hashtype.len() != 65 {
+            return Err(self.fail(ScriptError::SchnorrSigSize));
+        }
+
+        let sighash_type = if sig_with_hashtype.len() == 65 {
+            let ty = sig_with_hashtype[64];
+            if ty == TapSighashType::Default as u8 {
+                return Err(self.fail(ScriptError::SchnorrSigHashType));
+            }
+            TapSighashType::from_consensus_u8(ty)
+                .map_err(|_| self.fail(ScriptError::SchnorrSigHashType))?
+        } else {
+            TapSighashType::Default
+        };
+
+        let signature_bytes = &sig_with_hashtype[..64];
+        let signature = SchnorrSignature::from_slice(signature_bytes)
+            .map_err(|_| self.fail(ScriptError::SchnorrSig))?;
+
+        Ok(Some(TaprootSignatureParts {
+            signature,
+            sighash_type,
+        }))
+    }
+
+    fn consume_tapscript_sigop(&mut self) -> Result<(), Error> {
+        let remaining = match self.exec_data.validation_weight_left.as_mut() {
+            Some(value) => value,
+            None => return Err(self.fail(ScriptError::Unknown)),
+        };
+        *remaining -= VALIDATION_WEIGHT_PER_SIGOP_PASSED;
+        if *remaining < 0 {
+            Err(self.fail(ScriptError::TapscriptValidationWeight))
+        } else {
+            Ok(())
+        }
+    }
+
     fn check_signature_encoding(
         &mut self,
         sig_with_hashtype: &[u8],
@@ -1383,7 +1525,16 @@ impl<'tx, 'script> Interpreter<'tx, 'script> {
                 32 => self.verify_p2wsh(program, witness),
                 _ => Err(self.fail(ScriptError::WitnessProgramWrongLength)),
             },
-            1..=16 => {
+            1 => {
+                if program.len() == 32 {
+                    self.execute_taproot_program(program, witness)
+                } else if self.flags.bits() & VERIFY_DISCOURAGE_UPGRADABLE_WITNESS_PROGRAM != 0 {
+                    Err(self.fail(ScriptError::DiscourageUpgradableWitnessProgram))
+                } else {
+                    Ok(())
+                }
+            }
+            2..=16 => {
                 if self.flags.bits() & VERIFY_DISCOURAGE_UPGRADABLE_WITNESS_PROGRAM != 0 {
                     Err(self.fail(ScriptError::DiscourageUpgradableWitnessProgram))
                 } else {
@@ -1391,6 +1542,74 @@ impl<'tx, 'script> Interpreter<'tx, 'script> {
                 }
             }
             _ => Ok(()),
+        }
+    }
+
+    fn execute_taproot_program(&mut self, program: &[u8], witness: &Witness) -> Result<(), Error> {
+        if self.flags.bits() & VERIFY_TAPROOT == 0 {
+            return Ok(());
+        }
+
+        if witness.len() == 0 {
+            return Err(self.fail(ScriptError::WitnessProgramWitnessEmpty));
+        }
+
+        let mut stack_items: Vec<Vec<u8>> = witness.iter().map(|elem| elem.to_vec()).collect();
+        self.exec_data = ExecutionData::default();
+
+        let annex = if stack_items.len() >= 2 {
+            match stack_items.last() {
+                Some(bytes) if !bytes.is_empty() && bytes[0] == TAPROOT_ANNEX_PREFIX => {
+                    stack_items.pop()
+                }
+                _ => None,
+            }
+        } else {
+            None
+        };
+
+        self.exec_data.annex = annex;
+        self.exec_data.code_separator_pos = None;
+
+        if stack_items.is_empty() {
+            return Err(self.fail(ScriptError::WitnessProgramWitnessEmpty));
+        }
+
+        if stack_items.len() == 1 {
+            let signature = stack_items.pop().expect("length checked");
+            return self.verify_taproot_key_path(program, signature);
+        }
+
+        let control = stack_items.pop().expect("length checked");
+        self.validate_control_block(&control)?;
+        let script_bytes = stack_items.pop().expect("length checked");
+        let script = ScriptBuf::from_bytes(script_bytes);
+
+        let leaf_version = control[0] & TAPROOT_LEAF_MASK;
+        let tapleaf_hash = self.compute_tapleaf_hash(&script, leaf_version)?;
+        let merkle_root = self.compute_taproot_merkle_root(&control, tapleaf_hash)?;
+        self.verify_taproot_commitment(program, &control, merkle_root)?;
+        self.exec_data.tapleaf_hash = Some(tapleaf_hash);
+        self.exec_data.leaf_version = Some(leaf_version);
+
+        if leaf_version == TAPROOT_LEAF_TAPSCRIPT {
+            if contains_op_success(&script).map_err(|err| self.fail(err))? {
+                if self.flags.bits() & VERIFY_DISCOURAGE_OP_SUCCESS != 0 {
+                    return Err(self.fail(ScriptError::DiscourageOpSuccess));
+                }
+                return Ok(());
+            }
+            let witness_weight =
+                serialized_witness_size(witness).ok_or_else(|| self.fail(ScriptError::Unknown))?;
+            self.exec_data.validation_weight_left = Some(witness_weight + VALIDATION_WEIGHT_OFFSET);
+            let mut script_stack =
+                ScriptStack::from_items(stack_items).map_err(|err| self.fail(err))?;
+            self.run_script(&mut script_stack, script.as_bytes(), SigVersion::Taproot)?;
+            self.ensure_witness_success(&script_stack)
+        } else if self.flags.bits() & VERIFY_DISCOURAGE_UPGRADABLE_TAPROOT_VERSION != 0 {
+            Err(self.fail(ScriptError::DiscourageUpgradableTaprootVersion))
+        } else {
+            Ok(())
         }
     }
 
@@ -1413,6 +1632,102 @@ impl<'tx, 'script> Interpreter<'tx, 'script> {
 
         self.run_script(&mut stack, script.as_bytes(), SigVersion::WitnessV0)?;
         self.ensure_witness_success(&stack)
+    }
+
+    fn validate_control_block(&mut self, control: &[u8]) -> Result<(), Error> {
+        if control.len() < TAPROOT_CONTROL_BASE_SIZE
+            || control.len() > TAPROOT_CONTROL_MAX_SIZE
+            || (control.len() - TAPROOT_CONTROL_BASE_SIZE) % TAPROOT_CONTROL_NODE_SIZE != 0
+        {
+            return Err(self.fail(ScriptError::TaprootWrongControlSize));
+        }
+        Ok(())
+    }
+
+    fn compute_tapleaf_hash(
+        &mut self,
+        script: &ScriptBuf,
+        leaf_version: u8,
+    ) -> Result<TapLeafHash, Error> {
+        let mut engine = TapLeafHash::engine();
+        engine.input(&[leaf_version]);
+        script
+            .consensus_encode(&mut engine)
+            .map_err(|_| Error::ERR_SCRIPT)?;
+        Ok(TapLeafHash::from_engine(engine))
+    }
+
+    fn compute_taproot_merkle_root(
+        &mut self,
+        control: &[u8],
+        tapleaf_hash: TapLeafHash,
+    ) -> Result<TapNodeHash, Error> {
+        let mut current = TapNodeHash::from(tapleaf_hash);
+        let mut index = TAPROOT_CONTROL_BASE_SIZE;
+        while index < control.len() {
+            let end = index + TAPROOT_CONTROL_NODE_SIZE;
+            if end > control.len() {
+                return Err(self.fail(ScriptError::TaprootWrongControlSize));
+            }
+            let mut node_bytes = [0u8; TAPROOT_CONTROL_NODE_SIZE];
+            node_bytes.copy_from_slice(&control[index..end]);
+            let node = TapNodeHash::from_byte_array(node_bytes);
+            current = TapNodeHash::from_node_hashes(current, node);
+            index = end;
+        }
+        Ok(current)
+    }
+
+    fn verify_taproot_commitment(
+        &mut self,
+        program: &[u8],
+        control: &[u8],
+        merkle_root: TapNodeHash,
+    ) -> Result<(), Error> {
+        let internal_key = UntweakedPublicKey::from_slice(&control[1..TAPROOT_CONTROL_BASE_SIZE])
+            .map_err(|_| self.fail(ScriptError::WitnessProgramMismatch))?;
+        let output_key = XOnlyPublicKey::from_slice(program)
+            .map_err(|_| self.fail(ScriptError::WitnessProgramMismatch))?;
+        let parity_bit = control[0] & 1;
+        let secp = Secp256k1::verification_only();
+        let (expected_key, expected_parity) = internal_key.tap_tweak(&secp, Some(merkle_root));
+        let expected_parity_bit = match expected_parity {
+            Parity::Even => 0u8,
+            Parity::Odd => 1u8,
+        };
+        if parity_bit != expected_parity_bit {
+            return Err(self.fail(ScriptError::WitnessProgramMismatch));
+        }
+        if expected_key.to_x_only_public_key() != output_key {
+            return Err(self.fail(ScriptError::WitnessProgramMismatch));
+        }
+        Ok(())
+    }
+
+    fn verify_taproot_key_path(&mut self, program: &[u8], signature: Vec<u8>) -> Result<(), Error> {
+        if program.len() != 32 {
+            return Err(self.fail(ScriptError::WitnessProgramMismatch));
+        }
+        if signature.is_empty() {
+            return Err(self.fail(ScriptError::SchnorrSigSize));
+        }
+
+        let pubkey = XOnlyPublicKey::from_slice(program)
+            .map_err(|_| self.fail(ScriptError::WitnessProgramMismatch))?;
+        let Some(parts) = self.parse_taproot_signature(&signature)? else {
+            return Err(self.fail(ScriptError::SchnorrSigSize));
+        };
+        let is_valid = self.verify_taproot_signature_common(
+            &parts.signature,
+            parts.sighash_type,
+            &pubkey,
+            None,
+        )?;
+        if is_valid {
+            Ok(())
+        } else {
+            Err(self.fail(ScriptError::SchnorrSig))
+        }
     }
 
     fn verify_p2wsh(&mut self, program: &[u8], witness: &Witness) -> Result<(), Error> {
@@ -1458,6 +1773,76 @@ impl<'tx, 'script> Interpreter<'tx, 'script> {
             return Err(self.fail(ScriptError::EvalFalse));
         }
         Ok(())
+    }
+
+    fn verify_tapscript_signature(
+        &mut self,
+        sig_bytes: &[u8],
+        pubkey_bytes: &[u8],
+    ) -> Result<bool, Error> {
+        if pubkey_bytes.is_empty() {
+            return Err(self.fail(ScriptError::PubkeyType));
+        }
+
+        if pubkey_bytes.len() != 32 {
+            if self.flags.bits() & VERIFY_DISCOURAGE_UPGRADABLE_PUBKEYTYPE != 0 {
+                return Err(self.fail(ScriptError::DiscourageUpgradablePubkeyType));
+            }
+            return Ok(!sig_bytes.is_empty());
+        }
+
+        if sig_bytes.is_empty() {
+            return Ok(false);
+        }
+
+        self.consume_tapscript_sigop()?;
+        let Some(parts) = self.parse_taproot_signature(sig_bytes)? else {
+            return Ok(false);
+        };
+        let pubkey = XOnlyPublicKey::from_slice(pubkey_bytes)
+            .map_err(|_| self.fail(ScriptError::PubkeyType))?;
+        let tapleaf_hash = self
+            .exec_data
+            .tapleaf_hash
+            .ok_or_else(|| self.fail(ScriptError::WitnessProgramMismatch))?;
+        let code_separator = self.exec_data.code_separator_pos.unwrap_or(u32::MAX);
+        self.verify_taproot_signature_common(
+            &parts.signature,
+            parts.sighash_type,
+            &pubkey,
+            Some((tapleaf_hash, code_separator)),
+        )
+    }
+
+    fn verify_taproot_signature_common(
+        &mut self,
+        signature: &SchnorrSignature,
+        sighash_type: TapSighashType,
+        pubkey: &XOnlyPublicKey,
+        leaf_hash: Option<(TapLeafHash, u32)>,
+    ) -> Result<bool, Error> {
+        let spent_outputs = self
+            .spent_outputs
+            .as_ref()
+            .ok_or(Error::ERR_SPENT_OUTPUTS_REQUIRED)?;
+        let prevouts = Prevouts::All(spent_outputs.txouts());
+        let annex_bytes = self.exec_data.annex.as_deref();
+        let annex = if let Some(bytes) = annex_bytes {
+            match Annex::new(bytes) {
+                Ok(annex) => Some(annex),
+                Err(_) => return Err(self.fail(ScriptError::Unknown)),
+            }
+        } else {
+            None
+        };
+
+        let mut cache = SighashCache::new(self.tx_ctx.tx());
+        let sighash = cache
+            .taproot_signature_hash(self.input_index, &prevouts, annex, leaf_hash, sighash_type)
+            .map_err(|_| self.fail(ScriptError::SchnorrSigHashType))?;
+        let message = <Message as From<_>>::from(sighash);
+        let secp = Secp256k1::verification_only();
+        Ok(secp.verify_schnorr(signature, &message, pubkey).is_ok())
     }
 
     fn verify_ecdsa_signature(
@@ -1516,6 +1901,7 @@ impl<'tx, 'script> Interpreter<'tx, 'script> {
                 let sighash = SegwitV0Sighash::from_engine(engine);
                 <Message as From<_>>::from(sighash)
             }
+            SigVersion::Taproot => return Err(Error::ERR_SCRIPT),
         };
 
         let secp = Secp256k1::verification_only();
@@ -1740,6 +2126,40 @@ fn is_canonical_single_push(script_bytes: &[u8]) -> bool {
     instructions.next().is_none()
 }
 
+fn serialized_witness_size(witness: &Witness) -> Option<i64> {
+    let encoded = consensus::serialize(witness);
+    i64::try_from(encoded.len()).ok()
+}
+
+fn contains_op_success(script: &ScriptBuf) -> Result<bool, ScriptError> {
+    for instruction in script.instructions() {
+        let instruction = instruction.map_err(|_| ScriptError::BadOpcode)?;
+        if let Instruction::Op(opcode) = instruction {
+            if is_op_success(opcode) {
+                return Ok(true);
+            }
+        }
+    }
+    Ok(false)
+}
+
+/// Mirrors Bitcoin Core's `IsOpSuccess` table (`src/script/script.cpp` in
+/// `~/dev/bitcoin/bitcoin`). Keep this in sync with upstream whenever new
+/// semantics are assigned to the reserved opcodes.
+fn is_op_success(opcode: Opcode) -> bool {
+    matches!(
+        opcode.to_u8(),
+        80
+            | 98
+            | 126..=129
+            | 131..=134
+            | 137..=138
+            | 141..=142
+            | 149..=153
+            | 187..=254
+    )
+}
+
 fn count_sigops_bytes(script_bytes: &[u8], accurate: bool) -> Result<u32, Error> {
     let script = Script::from_bytes(script_bytes);
     count_sigops(&script, accurate)
@@ -1878,9 +2298,7 @@ fn is_compressed_pubkey(pubkey: &[u8]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{
-        VERIFY_P2SH, VERIFY_SIGPUSHONLY, VERIFY_TAPROOT, VERIFY_WITNESS,
-    };
+    use crate::{VERIFY_DERSIG, VERIFY_P2SH, VERIFY_SIGPUSHONLY, VERIFY_TAPROOT, VERIFY_WITNESS};
     use bitcoin::{
         blockdata::script::{Builder, PushBytesBuf},
         opcodes::all,
@@ -1899,10 +2317,25 @@ mod tests {
     }
 
     #[test]
-    fn flag_roundtrip_is_lossless() {
-        let bits = VERIFY_WITNESS | VERIFY_P2SH | VERIFY_SIGPUSHONLY;
+    fn flag_roundtrip_without_implied_bits_is_lossless() {
+        let bits = VERIFY_P2SH | VERIFY_SIGPUSHONLY | VERIFY_DERSIG;
         let flags = ScriptFlags::from_bits(bits).unwrap();
         assert_eq!(flags.bits(), bits);
+    }
+
+    #[test]
+    fn witness_flag_enables_helper_bits() {
+        let flags = ScriptFlags::from_bits(VERIFY_WITNESS).unwrap();
+        let expected = VERIFY_WITNESS | VERIFY_P2SH;
+        assert_eq!(flags.bits(), expected);
+    }
+
+    #[test]
+    fn taproot_flag_implies_witness_helpers() {
+        let flags = ScriptFlags::from_bits(VERIFY_TAPROOT).unwrap();
+        let expected = VERIFY_TAPROOT | VERIFY_WITNESS | VERIFY_P2SH;
+        assert_eq!(flags.bits(), expected);
+        assert!(flags.requires_spent_outputs());
     }
 
     #[test]
