@@ -12,6 +12,8 @@ use bitcoin::{
     transaction::Version,
     Amount, OutPoint, ScriptBuf, Sequence, Transaction, TxIn, TxOut, Witness,
 };
+#[cfg(feature = "core-diff")]
+use consensus::VERIFY_CHECKLOCKTIMEVERIFY;
 use consensus::{
     verify_with_flags_detailed, ScriptError, ScriptFailure, Utxo, VERIFY_CHECKSEQUENCEVERIFY,
     VERIFY_CLEANSTACK, VERIFY_DERSIG, VERIFY_DISCOURAGE_OP_SUCCESS,
@@ -20,8 +22,6 @@ use consensus::{
     VERIFY_MINIMALIF, VERIFY_NULLDUMMY, VERIFY_NULLFAIL, VERIFY_P2SH, VERIFY_SIGPUSHONLY,
     VERIFY_STRICTENC, VERIFY_TAPROOT, VERIFY_WITNESS, VERIFY_WITNESS_PUBKEYTYPE,
 };
-#[cfg(feature = "core-diff")]
-use consensus::VERIFY_CHECKLOCKTIMEVERIFY;
 use script_asm::{parse_script, ParseScriptError};
 use serde_json::Value;
 use std::fmt;

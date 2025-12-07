@@ -1999,8 +1999,12 @@ mod tests {
         let spent_outputs = SpentOutputs::new(1, &utxos).unwrap();
         let script_flags = ScriptFlags::from_bits(flags).unwrap();
         let precomputed = tx_ctx.build_precomputed(Some(&spent_outputs), false);
-        let spend_context =
-            SpendContext::new(spent_script.as_bytes(), Some(spent_outputs), amount.to_sat(), true);
+        let spend_context = SpendContext::new(
+            spent_script.as_bytes(),
+            Some(spent_outputs),
+            amount.to_sat(),
+            true,
+        );
         let mut interpreter =
             Interpreter::new(&tx_ctx, precomputed, 0, spend_context, script_flags).unwrap();
 

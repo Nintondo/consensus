@@ -11,13 +11,13 @@ use std::sync::OnceLock;
 #[cfg(feature = "std")]
 use std::vec::Vec;
 
-use core::mem;
+use core::{cell::RefCell, mem};
 
 use bitcoin::{
     absolute::LOCK_TIME_THRESHOLD,
     blockdata::script::{Instruction, PushBytesBuf, Script, ScriptBuf},
     blockdata::transaction::Sequence,
-    consensus::{self, Encodable},
+    consensus::Encodable,
     hashes::{hash160, ripemd160, sha1, sha256, sha256d, Hash, HashEngine},
     key::{TapTweak, UntweakedPublicKey},
     opcodes::{all, Opcode},
@@ -32,7 +32,7 @@ use bitcoin::{
         TAPROOT_CONTROL_MAX_SIZE, TAPROOT_CONTROL_NODE_SIZE, TAPROOT_LEAF_MASK,
         TAPROOT_LEAF_TAPSCRIPT,
     },
-    Amount, Witness,
+    Amount, Transaction, Witness,
 };
 
 use crate::{
@@ -221,6 +221,58 @@ struct ExecutionData {
     validation_weight_left: Option<i64>,
 }
 
+struct ControlBlock<'a> {
+    bytes: &'a [u8],
+}
+
+impl<'a> ControlBlock<'a> {
+    fn parse(bytes: &'a [u8]) -> Result<Self, ScriptError> {
+        if bytes.len() < TAPROOT_CONTROL_BASE_SIZE
+            || bytes.len() > TAPROOT_CONTROL_MAX_SIZE
+            || (bytes.len() - TAPROOT_CONTROL_BASE_SIZE) % TAPROOT_CONTROL_NODE_SIZE != 0
+        {
+            return Err(ScriptError::TaprootWrongControlSize);
+        }
+        Ok(Self { bytes })
+    }
+
+    fn bytes(&self) -> &'a [u8] {
+        self.bytes
+    }
+
+    fn leaf_version(&self) -> u8 {
+        self.bytes[0] & TAPROOT_LEAF_MASK
+    }
+}
+
+#[derive(Default)]
+struct ScriptCodeCache {
+    identity: ScriptIdentity,
+    code_separator: usize,
+    script: ScriptBuf,
+}
+
+#[derive(Copy, Clone, Default, PartialEq, Eq)]
+struct ScriptIdentity {
+    ptr: *const u8,
+    len: usize,
+}
+
+impl ScriptIdentity {
+    fn new(script: &Script) -> Self {
+        Self {
+            ptr: script.as_bytes().as_ptr(),
+            len: script.as_bytes().len(),
+        }
+    }
+}
+
+impl ScriptCodeCache {
+    fn matches(&self, identity: ScriptIdentity, code_separator: usize) -> bool {
+        self.identity == identity && self.code_separator == code_separator
+    }
+}
+
 /// Minimal stack abstraction used by the interpreter.
 #[derive(Debug, Default, Clone)]
 pub struct ScriptStack {
@@ -250,6 +302,21 @@ impl ScriptStack {
         }
         let mut items = Vec::with_capacity(witness.len());
         for elem in witness.iter() {
+            let bytes = elem.to_vec();
+            if bytes.len() > MAX_SCRIPT_ELEMENT_SIZE {
+                return Err(ScriptError::PushSize);
+            }
+            items.push(bytes);
+        }
+        Ok(Self { items })
+    }
+
+    pub fn from_witness_prefix(witness: &Witness, end: usize) -> Result<Self, ScriptError> {
+        if end > witness.len() || end > MAX_STACK_SIZE {
+            return Err(ScriptError::StackSize);
+        }
+        let mut items = Vec::with_capacity(end);
+        for elem in witness.iter().take(end) {
             let bytes = elem.to_vec();
             if bytes.len() > MAX_SCRIPT_ELEMENT_SIZE {
                 return Err(ScriptError::PushSize);
@@ -326,6 +393,8 @@ pub struct Interpreter<'tx, 'script> {
     tx_ctx: &'tx TransactionContext,
     _precomputed: PrecomputedTransactionData,
     input_index: usize,
+    script_code_cache: Option<ScriptCodeCache>,
+    sighash_cache: RefCell<SighashCache<&'tx Transaction>>,
     stack: ScriptStack,
     exec_stack: Vec<bool>,
     exec_data: ExecutionData,
@@ -363,6 +432,8 @@ impl<'tx, 'script> Interpreter<'tx, 'script> {
             tx_ctx,
             _precomputed: precomputed,
             input_index,
+            script_code_cache: None,
+            sighash_cache: RefCell::new(SighashCache::new(tx_ctx.tx())),
             stack: ScriptStack::new(),
             exec_stack: Vec::new(),
             exec_data: ExecutionData::default(),
@@ -429,7 +500,9 @@ impl<'tx, 'script> Interpreter<'tx, 'script> {
                 return Err(self.fail(ScriptError::SigPushOnly));
             }
 
-            let mut stack_copy = p2sh_stack.take().unwrap_or_else(|| self.stack.clone());
+            let mut stack_copy = p2sh_stack
+                .take()
+                .expect("P2SH spend requires preserved stack state");
             if stack_copy.is_empty() {
                 return Err(self.fail(ScriptError::EvalFalse));
             }
@@ -1526,10 +1599,33 @@ impl<'tx, 'script> Interpreter<'tx, 'script> {
     }
 
     fn build_script_code(
-        &self,
+        &mut self,
         script: &Script,
         code_separator: usize,
     ) -> Result<ScriptBuf, Error> {
+        let identity = ScriptIdentity::new(script);
+        let needs_refresh = self
+            .script_code_cache
+            .as_ref()
+            .map(|cache| !cache.matches(identity, code_separator))
+            .unwrap_or(true);
+        if needs_refresh {
+            let script_buf = Self::materialize_script_code(script, code_separator)?;
+            self.script_code_cache = Some(ScriptCodeCache {
+                identity,
+                code_separator,
+                script: script_buf,
+            });
+        }
+        Ok(self
+            .script_code_cache
+            .as_ref()
+            .expect("script code cache is initialized")
+            .script
+            .clone())
+    }
+
+    fn materialize_script_code(script: &Script, code_separator: usize) -> Result<ScriptBuf, Error> {
         if code_separator > script.as_bytes().len() {
             return Err(Error::ERR_SCRIPT);
         }
@@ -1579,46 +1675,44 @@ impl<'tx, 'script> Interpreter<'tx, 'script> {
             return Err(self.fail(ScriptError::WitnessProgramWitnessEmpty));
         }
 
-        let mut stack_items: Vec<Vec<u8>> = witness.iter().map(|elem| elem.to_vec()).collect();
         self.exec_data = ExecutionData::default();
 
-        let annex = if stack_items.len() >= 2 {
-            match stack_items.last() {
-                Some(bytes) if !bytes.is_empty() && bytes[0] == TAPROOT_ANNEX_PREFIX => {
-                    stack_items.pop()
-                }
-                _ => None,
+        let mut stack_len = witness.len();
+        let mut annex: Option<Vec<u8>> = None;
+        if stack_len >= 2 {
+            let last = witness[stack_len - 1].as_ref();
+            if !last.is_empty() && last[0] == TAPROOT_ANNEX_PREFIX {
+                annex = Some(last.to_vec());
+                stack_len -= 1;
             }
-        } else {
-            None
-        };
+        }
 
         self.exec_data.annex = annex;
         self.exec_data.code_separator_pos = None;
 
-        if stack_items.is_empty() {
+        if stack_len == 0 {
             return Err(self.fail(ScriptError::WitnessProgramWitnessEmpty));
         }
 
-        if stack_items.len() == 1 {
-            let signature = stack_items.pop().expect("length checked");
+        if stack_len == 1 {
+            let signature = witness[0].to_vec();
             return self.verify_taproot_key_path(program, signature);
         }
 
-        let control = stack_items.pop().expect("length checked");
-        self.validate_control_block(&control)?;
-        let script_bytes = stack_items.pop().expect("length checked");
-        let script = ScriptBuf::from_bytes(script_bytes);
-
-        let leaf_version = control[0] & TAPROOT_LEAF_MASK;
+        let control_slice = witness[stack_len - 1].as_ref();
+        let control = ControlBlock::parse(control_slice).map_err(|err| self.fail(err))?;
+        let script_bytes = witness[stack_len - 2].as_ref();
+        let script = Script::from_bytes(script_bytes);
+        stack_len -= 2;
+        let leaf_version = control.leaf_version();
         let tapleaf_hash = self.compute_tapleaf_hash(&script, leaf_version)?;
-        let merkle_root = self.compute_taproot_merkle_root(&control, tapleaf_hash)?;
-        self.verify_taproot_commitment(program, &control, merkle_root)?;
+        let merkle_root = self.compute_taproot_merkle_root(control.bytes(), tapleaf_hash)?;
+        self.verify_taproot_commitment(program, control.bytes(), merkle_root)?;
         self.exec_data.tapleaf_hash = Some(tapleaf_hash);
         self.exec_data.leaf_version = Some(leaf_version);
 
         if leaf_version == TAPROOT_LEAF_TAPSCRIPT {
-            if contains_op_success(&script).map_err(|err| self.fail(err))? {
+            if contains_op_success(script).map_err(|err| self.fail(err))? {
                 if self.flags.bits() & VERIFY_DISCOURAGE_OP_SUCCESS != 0 {
                     return Err(self.fail(ScriptError::DiscourageOpSuccess));
                 }
@@ -1627,8 +1721,8 @@ impl<'tx, 'script> Interpreter<'tx, 'script> {
             let witness_weight =
                 serialized_witness_size(witness).ok_or_else(|| self.fail(ScriptError::Unknown))?;
             self.exec_data.validation_weight_left = Some(witness_weight + VALIDATION_WEIGHT_OFFSET);
-            let mut script_stack =
-                ScriptStack::from_items(stack_items).map_err(|err| self.fail(err))?;
+            let mut script_stack = ScriptStack::from_witness_prefix(witness, stack_len)
+                .map_err(|err| self.fail(err))?;
             self.run_script(&mut script_stack, script.as_bytes(), SigVersion::Taproot)?;
             self.ensure_witness_success(&script_stack)
         } else if self.flags.bits() & VERIFY_DISCOURAGE_UPGRADABLE_TAPROOT_VERSION != 0 {
@@ -1659,20 +1753,9 @@ impl<'tx, 'script> Interpreter<'tx, 'script> {
         self.ensure_witness_success(&stack)
     }
 
-    fn validate_control_block(&mut self, control: &[u8]) -> Result<(), Error> {
-        if control.len() < TAPROOT_CONTROL_BASE_SIZE
-            || control.len() > TAPROOT_CONTROL_MAX_SIZE
-            || !(control.len() - TAPROOT_CONTROL_BASE_SIZE)
-                .is_multiple_of(TAPROOT_CONTROL_NODE_SIZE)
-        {
-            return Err(self.fail(ScriptError::TaprootWrongControlSize));
-        }
-        Ok(())
-    }
-
     fn compute_tapleaf_hash(
         &mut self,
-        script: &ScriptBuf,
+        script: &Script,
         leaf_version: u8,
     ) -> Result<TapLeafHash, Error> {
         let mut engine = TapLeafHash::engine();
@@ -1863,10 +1946,17 @@ impl<'tx, 'script> Interpreter<'tx, 'script> {
             None
         };
 
-        let mut cache = SighashCache::new(self.tx_ctx.tx());
-        let sighash = cache
-            .taproot_signature_hash(self.input_index, &prevouts, annex, leaf_hash, sighash_type)
-            .map_err(|_| self.fail(ScriptError::SchnorrSigHashType))?;
+        let sighash_res = {
+            let mut cache = self.sighash_cache.borrow_mut();
+            cache.taproot_signature_hash(
+                self.input_index,
+                &prevouts,
+                annex,
+                leaf_hash,
+                sighash_type,
+            )
+        };
+        let sighash = sighash_res.map_err(|_| self.fail(ScriptError::SchnorrSigHashType))?;
         let message = <Message as From<_>>::from(sighash);
         let is_valid = with_secp256k1_verification_ctx(|secp| {
             secp.verify_schnorr(signature, &message, pubkey).is_ok()
@@ -1908,35 +1998,40 @@ impl<'tx, 'script> Interpreter<'tx, 'script> {
             script_bytes = filtered;
         }
         let script_buf = ScriptBuf::from_bytes(script_bytes);
-        let mut cache = SighashCache::new(self.tx_ctx.tx());
         let message = match sigversion {
             SigVersion::Base => {
-                let sighash = cache
+                let sighash = self
+                    .sighash_cache
+                    .borrow()
                     .legacy_signature_hash(self.input_index, &script_buf, raw_sighash_type)
                     .map_err(|_| Error::ERR_SCRIPT)?;
                 <Message as From<_>>::from(sighash)
             }
             SigVersion::WitnessV0 => {
                 let mut engine = SegwitV0Sighash::engine();
-                cache
-                    .segwit_v0_encode_signing_data_to(
-                        &mut engine,
-                        self.input_index,
-                        &script_buf,
-                        Amount::from_sat(self.amount),
-                        sighash_type,
-                    )
-                    .map_err(|_| Error::ERR_SCRIPT)?;
+                {
+                    let mut cache = self.sighash_cache.borrow_mut();
+                    cache
+                        .segwit_v0_encode_signing_data_to(
+                            &mut engine,
+                            self.input_index,
+                            &script_buf,
+                            Amount::from_sat(self.amount),
+                            sighash_type,
+                        )
+                        .map_err(|_| Error::ERR_SCRIPT)?;
+                }
                 let sighash = SegwitV0Sighash::from_engine(engine);
                 <Message as From<_>>::from(sighash)
             }
             SigVersion::Taproot => return Err(Error::ERR_SCRIPT),
         };
 
-        let secp = Secp256k1::verification_only();
-        Ok(secp
-            .verify_ecdsa(&message, &normalized_sig, &pubkey)
-            .is_ok())
+        let is_valid = with_secp256k1_verification_ctx(|secp| {
+            secp.verify_ecdsa(&message, &normalized_sig, &pubkey)
+                .is_ok()
+        });
+        Ok(is_valid)
     }
 }
 
@@ -2156,20 +2251,80 @@ fn is_canonical_single_push(script_bytes: &[u8]) -> bool {
 }
 
 fn serialized_witness_size(witness: &Witness) -> Option<i64> {
-    let encoded = consensus::serialize(witness);
-    i64::try_from(encoded.len()).ok()
+    let mut total: u64 = compact_size_len(witness.len() as u64);
+    for element in witness.iter() {
+        let len = element.len() as u64;
+        total = total.checked_add(compact_size_len(len))?;
+        total = total.checked_add(len)?;
+    }
+    i64::try_from(total).ok()
 }
 
-fn contains_op_success(script: &ScriptBuf) -> Result<bool, ScriptError> {
-    for instruction in script.instructions() {
-        let instruction = instruction.map_err(|_| ScriptError::BadOpcode)?;
-        if let Instruction::Op(opcode) = instruction {
-            if is_op_success(opcode) {
-                return Ok(true);
+fn compact_size_len(value: u64) -> u64 {
+    match value {
+        0..=0xfc => 1,
+        0xfd..=0xffff => 3,
+        0x1_0000..=0xffff_ffff => 5,
+        _ => 9,
+    }
+}
+
+fn contains_op_success(script: &Script) -> Result<bool, ScriptError> {
+    let bytes = script.as_bytes();
+    let mut index = 0usize;
+
+    while index < bytes.len() {
+        let opcode = bytes[index];
+        index += 1;
+        match opcode {
+            0x01..=0x4b => {
+                let push_len = opcode as usize;
+                index = index
+                    .checked_add(push_len)
+                    .filter(|idx| *idx <= bytes.len())
+                    .ok_or(ScriptError::BadOpcode)?;
+            }
+            0x4c => {
+                let len = read_push_length(bytes, &mut index, 1)?;
+                skip_push_data(bytes, len, &mut index)?;
+            }
+            0x4d => {
+                let len = read_push_length(bytes, &mut index, 2)?;
+                skip_push_data(bytes, len, &mut index)?;
+            }
+            0x4e => {
+                let len = read_push_length(bytes, &mut index, 4)?;
+                skip_push_data(bytes, len, &mut index)?;
+            }
+            _ => {
+                if is_op_success(Opcode::from(opcode)) {
+                    return Ok(true);
+                }
             }
         }
     }
+
     Ok(false)
+}
+
+fn read_push_length(bytes: &[u8], index: &mut usize, width: usize) -> Result<usize, ScriptError> {
+    if bytes.len() < *index + width {
+        return Err(ScriptError::BadOpcode);
+    }
+    let mut len: usize = 0;
+    for i in 0..width {
+        len |= (bytes[*index + i] as usize) << (8 * i);
+    }
+    *index += width;
+    Ok(len)
+}
+
+fn skip_push_data(bytes: &[u8], len: usize, index: &mut usize) -> Result<(), ScriptError> {
+    *index = index
+        .checked_add(len)
+        .filter(|idx| *idx <= bytes.len())
+        .ok_or(ScriptError::BadOpcode)?;
+    Ok(())
 }
 
 /// Mirrors Bitcoin Core's `IsOpSuccess` table (`src/script/script.cpp` in

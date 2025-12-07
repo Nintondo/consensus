@@ -130,7 +130,8 @@ fn run_random_case(case: &RandomCase) {
     assert!(
         ours_ok == core_ok,
         "random case diverged\nscriptPubKey={:?}\nflags={:#x}\nours={ours:?}\ncore={core:?}",
-        case.script_pubkey, case.flags
+        case.script_pubkey,
+        case.flags
     );
 }
 
@@ -168,7 +169,12 @@ impl Scenario {
         if flags & VERIFY_WITNESS != 0 {
             flags |= VERIFY_P2SH;
         }
-        let tx_bytes = build_spend_transaction(&self.script_pubkey, &self.script_sig, &self.witness, self.amount);
+        let tx_bytes = build_spend_transaction(
+            &self.script_pubkey,
+            &self.script_sig,
+            &self.witness,
+            self.amount,
+        );
         let prevout = if self.needs_prevout {
             Some(Prevout::new(&self.script_pubkey, self.amount))
         } else {
@@ -198,11 +204,8 @@ fn scenario_strategy() -> impl Strategy<Value = Scenario> {
 }
 
 fn legacy_basic_scenario() -> impl Strategy<Value = Scenario> {
-    (
-        stack_items_strategy(0..4),
-        script_template_strategy(),
-    )
-        .prop_map(|(stack_items, script)| Scenario {
+    (stack_items_strategy(0..4), script_template_strategy()).prop_map(|(stack_items, script)| {
+        Scenario {
             script_sig: build_push_script(
                 &stack_items
                     .into_iter()
@@ -214,7 +217,8 @@ fn legacy_basic_scenario() -> impl Strategy<Value = Scenario> {
             amount: 0,
             required_flags: VERIFY_NONE,
             needs_prevout: false,
-        })
+        }
+    })
 }
 
 fn control_flow_scenario() -> impl Strategy<Value = Scenario> {
@@ -225,41 +229,43 @@ fn control_flow_scenario() -> impl Strategy<Value = Scenario> {
         stack_items_strategy(0..2),
         prop::option::of(script_template_strategy()),
     )
-        .prop_map(|(cond_true, use_else, violate_min_if, stack_items, else_script)| {
-            let mut required_flags = VERIFY_NONE;
-            let mut builder = Builder::new();
-            if violate_min_if {
-                builder =
-                    builder.push_slice(PushBytesBuf::try_from(vec![2u8]).expect("push bytes"));
-                required_flags |= VERIFY_MINIMALIF;
-            } else {
-                builder = builder.push_int(if cond_true { 1 } else { 0 });
-            }
-            builder = builder.push_opcode(all::OP_IF);
-            builder = builder.push_int(1).push_opcode(all::OP_DROP);
-            if use_else {
-                builder = builder.push_opcode(all::OP_ELSE);
-                if let Some(script) = else_script {
-                    builder = append_script(builder, &script);
+        .prop_map(
+            |(cond_true, use_else, violate_min_if, stack_items, else_script)| {
+                let mut required_flags = VERIFY_NONE;
+                let mut builder = Builder::new();
+                if violate_min_if {
+                    builder =
+                        builder.push_slice(PushBytesBuf::try_from(vec![2u8]).expect("push bytes"));
+                    required_flags |= VERIFY_MINIMALIF;
                 } else {
-                    builder = builder.push_int(2).push_opcode(all::OP_DROP);
+                    builder = builder.push_int(if cond_true { 1 } else { 0 });
                 }
-            }
-            builder = builder.push_opcode(all::OP_ENDIF);
-            Scenario {
-                script_sig: build_push_script(
-                    &stack_items
-                        .into_iter()
-                        .map(|data| (data, PushEncoding::Minimal))
-                        .collect::<Vec<_>>(),
-                ),
-                script_pubkey: builder.into_script(),
-                witness: Witness::new(),
-                amount: 0,
-                required_flags,
-                needs_prevout: false,
-            }
-        })
+                builder = builder.push_opcode(all::OP_IF);
+                builder = builder.push_int(1).push_opcode(all::OP_DROP);
+                if use_else {
+                    builder = builder.push_opcode(all::OP_ELSE);
+                    if let Some(script) = else_script {
+                        builder = append_script(builder, &script);
+                    } else {
+                        builder = builder.push_int(2).push_opcode(all::OP_DROP);
+                    }
+                }
+                builder = builder.push_opcode(all::OP_ENDIF);
+                Scenario {
+                    script_sig: build_push_script(
+                        &stack_items
+                            .into_iter()
+                            .map(|data| (data, PushEncoding::Minimal))
+                            .collect::<Vec<_>>(),
+                    ),
+                    script_pubkey: builder.into_script(),
+                    witness: Witness::new(),
+                    amount: 0,
+                    required_flags,
+                    needs_prevout: false,
+                }
+            },
+        )
 }
 
 fn minimal_data_violation_scenario() -> impl Strategy<Value = Scenario> {
@@ -350,11 +356,8 @@ fn multisig_scenario() -> impl Strategy<Value = Scenario> {
 }
 
 fn p2sh_scenario() -> impl Strategy<Value = Scenario> {
-    (
-        script_template_strategy(),
-        stack_items_strategy(0..3),
-    )
-        .prop_map(|(redeem_script, stack_items)| {
+    (script_template_strategy(), stack_items_strategy(0..3)).prop_map(
+        |(redeem_script, stack_items)| {
             let redeem_hash = redeem_script.script_hash();
             let script_pubkey = ScriptBuf::new_p2sh(&redeem_hash);
 
@@ -372,7 +375,8 @@ fn p2sh_scenario() -> impl Strategy<Value = Scenario> {
                 required_flags: VERIFY_P2SH,
                 needs_prevout: false,
             }
-        })
+        },
+    )
 }
 
 fn p2wsh_scenario() -> impl Strategy<Value = Scenario> {
@@ -469,7 +473,10 @@ fn hash_compare_script() -> impl Strategy<Value = ScriptBuf> {
 fn num_equal_verify_script() -> impl Strategy<Value = ScriptBuf> {
     ((-1000i64..=1000), (-1000i64..=1000)).prop_map(|(a, b)| {
         let mut builder = Builder::new();
-        builder = builder.push_int(a).push_int(b).push_opcode(all::OP_NUMEQUALVERIFY);
+        builder = builder
+            .push_int(a)
+            .push_int(b)
+            .push_opcode(all::OP_NUMEQUALVERIFY);
         builder.into_script()
     })
 }
@@ -541,8 +548,8 @@ fn append_script(mut builder: Builder, script: &ScriptBuf) -> Builder {
                 builder = builder.push_opcode(op);
             }
             ScriptInstruction::PushBytes(bytes) => {
-                builder = builder
-                    .push_slice(PushBytesBuf::try_from(bytes.as_bytes().to_vec()).unwrap());
+                builder =
+                    builder.push_slice(PushBytesBuf::try_from(bytes.as_bytes().to_vec()).unwrap());
             }
         }
     }

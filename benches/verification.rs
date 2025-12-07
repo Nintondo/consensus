@@ -9,8 +9,10 @@ use bitcoin::{
     taproot::{TapLeafHash, TapNodeHash, TAPROOT_LEAF_TAPSCRIPT},
     Amount, OutPoint, ScriptBuf, Sequence, Transaction, TxIn, TxOut, Witness,
 };
+use consensus::{
+    verify_with_flags, Utxo, VERIFY_ALL_PRE_TAPROOT, VERIFY_P2SH, VERIFY_TAPROOT, VERIFY_WITNESS,
+};
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
-use consensus::{verify_with_flags, Utxo, VERIFY_ALL_PRE_TAPROOT, VERIFY_P2SH, VERIFY_TAPROOT, VERIFY_WITNESS};
 
 #[cfg(feature = "core-diff")]
 use bitcoinconsensus;
@@ -70,10 +72,7 @@ fn run_case_rust(case: &BenchCase) {
 
 #[cfg(feature = "core-diff")]
 fn run_case_core(case: &BenchCase) {
-    let prevouts = case
-        .prevouts
-        .as_ref()
-        .map(|p| build_core_prevouts(p));
+    let prevouts = case.prevouts.as_ref().map(|p| build_core_prevouts(p));
     bitcoinconsensus::verify_with_flags(
         case.script_pubkey.as_slice(),
         case.amount,
