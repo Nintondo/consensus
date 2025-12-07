@@ -99,7 +99,7 @@ Exit criteria: Taproot spends (key and script paths) verify identically to Core 
    - New: `cargo test --features core-diff` now replays Bitcoin Core’s `script_tests.json` through both this crate and `libbitcoinconsensus` (via the `bitcoinconsensus` crate) and asserts that both agree on every non-Taproot vector. This gives us a ready-made differential harness while we work toward fuzzing support.
 
 2. **Performance / Memory Profiling**  
-   - Benchmark against Core for representative workloads; optimize stack handling, sighash caching, and script parsing.  
+   - ✅ Added a Criterion-based benchmarking harness (`cargo bench --bench verification`) that exercises representative spends (legacy P2PKH, P2SH, P2WSH, Taproot script path) through our interpreter. When `core-diff` is enabled the same harness also measures `libbitcoinconsensus`, giving us side-by-side numbers for future optimizations (stack handling, sighash caching, parser tweaks).  
    - Ensure `no_std` builds remain efficient (minimize allocations, use `alloc` wisely).
 
 3. **Documentation & Maintenance**  
