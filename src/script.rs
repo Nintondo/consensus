@@ -8,6 +8,8 @@
 use alloc::{vec, vec::Vec};
 #[cfg(feature = "std")]
 use std::vec::Vec;
+#[cfg(all(feature = "std", not(feature = "external-secp")))]
+use std::sync::OnceLock;
 
 use core::mem;
 
@@ -21,7 +23,7 @@ use bitcoin::{
     opcodes::{all, Opcode},
     script::Builder,
     secp256k1::{
-        ecdsa::Signature as EcdsaSignature, schnorr::Signature as SchnorrSignature, Message,
+        self, ecdsa::Signature as EcdsaSignature, schnorr::Signature as SchnorrSignature, Message,
         Parity, PublicKey, Secp256k1, XOnlyPublicKey,
     },
     sighash::{Annex, EcdsaSighashType, Prevouts, SegwitV0Sighash, SighashCache, TapSighashType},
@@ -132,6 +134,33 @@ const SEQUENCE_LOCKTIME_MASK: u32 = 0x0000ffff;
 const SEQUENCE_LOCKTIME_GRANULARITY: u32 = 9;
 const VALIDATION_WEIGHT_PER_SIGOP_PASSED: i64 = 50;
 const VALIDATION_WEIGHT_OFFSET: i64 = 50;
+
+#[cfg(all(feature = "external-secp", feature = "std"))]
+type VerificationContext = Secp256k1<secp256k1::All>;
+#[cfg(not(all(feature = "external-secp", feature = "std")))]
+type VerificationContext = Secp256k1<secp256k1::VerifyOnly>;
+
+#[cfg(all(feature = "std", not(feature = "external-secp")))]
+static SECP256K1: OnceLock<VerificationContext> = OnceLock::new();
+
+fn with_secp256k1_verification_ctx<R>(f: impl FnOnce(&VerificationContext) -> R) -> R {
+    #[cfg(all(feature = "std", feature = "external-secp"))]
+    {
+        // `bitcoin::secp256k1` re-exports the `global` module when the upstream
+        // `secp256k1` crate is built with the `global-context` feature, so we can
+        // piggyback on that singleton instead of creating ad-hoc contexts.
+        f(&*bitcoin::secp256k1::global::SECP256K1)
+    }
+    #[cfg(all(feature = "std", not(feature = "external-secp")))]
+    {
+        f(SECP256K1.get_or_init(Secp256k1::verification_only))
+    }
+    #[cfg(not(feature = "std"))]
+    {
+        let ctx = Secp256k1::verification_only();
+        f(&ctx)
+    }
+}
 
 /// Wrapper for script verification flags.
 #[derive(Debug, Clone, Copy)]
@@ -247,11 +276,7 @@ impl ScriptStack {
     }
 
     pub fn pop_bytes(&mut self) -> Result<Vec<u8>, Error> {
-        self.items.pop().ok_or_else(|| {
-            #[cfg(test)]
-            eprintln!("pop_bytes underflow");
-            Error::ERR_SCRIPT
-        })
+        self.items.pop().ok_or(Error::ERR_SCRIPT)
     }
 
     pub fn last(&self) -> Option<&Vec<u8>> {
@@ -329,12 +354,6 @@ impl<'tx, 'script> Interpreter<'tx, 'script> {
         self.had_witness = false;
         self.exec_data = ExecutionData::default();
         let txin = &self.tx_ctx.tx().input[self.input_index];
-        if txin.script_sig.as_bytes() == [0x4c, 0x01] {
-            eprintln!(
-                "debug interpreter script_sig observed truncated push len={}",
-                txin.script_sig.as_bytes().len()
-            );
-        }
         self.initialize_sigops(txin.script_sig.as_bytes())?;
         let witness_enabled = self.flags.bits() & VERIFY_WITNESS != 0;
         let p2sh_enabled = self.flags.bits() & VERIFY_P2SH != 0;
@@ -368,7 +387,10 @@ impl<'tx, 'script> Interpreter<'tx, 'script> {
                     return Err(self.fail(ScriptError::WitnessMalleated));
                 }
                 let witness_res = self.execute_witness_program(version, program, &txin.witness);
-                return self.track_script_error(witness_res);
+                self.track_script_error(witness_res)?;
+                let mut stack = ScriptStack::new();
+                self.push_bool_element(&mut stack, true)?;
+                self.stack = stack;
             }
         }
 
@@ -503,16 +525,7 @@ impl<'tx, 'script> Interpreter<'tx, 'script> {
         self.exec_stack.clear();
         self.op_count = 0;
         let script = ScriptBuf::from_bytes(script_bytes.to_vec());
-        if script.as_bytes() == [0x4c, 0x01].as_slice() {
-            eprintln!("debug run_script executing truncated script");
-        }
         let instruction_result = script.instruction_indices().collect::<Result<Vec<_>, _>>();
-        if script_bytes.len() == 2 {
-            eprintln!(
-                "debug run_script len2 script={:x?} instructions={:?}",
-                script_bytes, instruction_result
-            );
-        }
         let instructions = match instruction_result {
             Ok(instrs) => instrs,
             Err(_) => return Err(self.fail(ScriptError::BadOpcode)),
@@ -1309,24 +1322,15 @@ impl<'tx, 'script> Interpreter<'tx, 'script> {
         let tx_lock = tx.lock_time.to_consensus_u32();
         let locktime_u32 = locktime as u32;
         if tx_lock < locktime_u32 {
-            #[cfg(test)]
-            eprintln!("CLTV fail: tx_lock {} < required {}", tx_lock, locktime_u32);
             return Err(ScriptError::UnsatisfiedLockTime);
         }
 
         if (tx_lock < LOCK_TIME_THRESHOLD) != (locktime_u32 < LOCK_TIME_THRESHOLD) {
-            #[cfg(test)]
-            eprintln!(
-                "CLTV unit mismatch tx {} required {}",
-                tx_lock, locktime_u32
-            );
             return Err(ScriptError::UnsatisfiedLockTime);
         }
 
         let sequence = tx.input[self.input_index].sequence.to_consensus_u32();
         if sequence == Sequence::MAX.0 {
-            #[cfg(test)]
-            eprintln!("CLTV fail: sequence final");
             return Err(ScriptError::UnsatisfiedLockTime);
         }
 
@@ -1346,19 +1350,12 @@ impl<'tx, 'script> Interpreter<'tx, 'script> {
             .sequence
             .to_consensus_u32();
         if tx_sequence & SEQUENCE_LOCKTIME_DISABLE_FLAG != 0 {
-            #[cfg(test)]
-            eprintln!("CSV fail: tx sequence disable flag set");
             return Err(ScriptError::UnsatisfiedLockTime);
         }
 
         let tx_type = tx_sequence & SEQUENCE_LOCKTIME_TYPE_FLAG;
         let seq_type = sequence_u32 & SEQUENCE_LOCKTIME_TYPE_FLAG;
         if tx_type != seq_type {
-            #[cfg(test)]
-            eprintln!(
-                "CSV fail: type mismatch tx {:x} seq {:x}",
-                tx_sequence, sequence_u32
-            );
             return Err(ScriptError::UnsatisfiedLockTime);
         }
 
@@ -1374,8 +1371,6 @@ impl<'tx, 'script> Interpreter<'tx, 'script> {
         };
 
         if tx_value < seq_value {
-            #[cfg(test)]
-            eprintln!("CSV fail: tx_value {} < required {}", tx_value, seq_value);
             return Err(ScriptError::UnsatisfiedLockTime);
         }
 
@@ -1689,19 +1684,20 @@ impl<'tx, 'script> Interpreter<'tx, 'script> {
         let output_key = XOnlyPublicKey::from_slice(program)
             .map_err(|_| self.fail(ScriptError::WitnessProgramMismatch))?;
         let parity_bit = control[0] & 1;
-        let secp = Secp256k1::verification_only();
-        let (expected_key, expected_parity) = internal_key.tap_tweak(&secp, Some(merkle_root));
-        let expected_parity_bit = match expected_parity {
-            Parity::Even => 0u8,
-            Parity::Odd => 1u8,
-        };
-        if parity_bit != expected_parity_bit {
-            return Err(self.fail(ScriptError::WitnessProgramMismatch));
-        }
-        if expected_key.to_x_only_public_key() != output_key {
-            return Err(self.fail(ScriptError::WitnessProgramMismatch));
-        }
-        Ok(())
+        with_secp256k1_verification_ctx(|secp| {
+            let (expected_key, expected_parity) = internal_key.tap_tweak(secp, Some(merkle_root));
+            let expected_parity_bit = match expected_parity {
+                Parity::Even => 0u8,
+                Parity::Odd => 1u8,
+            };
+            if parity_bit != expected_parity_bit {
+                return Err(self.fail(ScriptError::WitnessProgramMismatch));
+            }
+            if expected_key.to_x_only_public_key() != output_key {
+                return Err(self.fail(ScriptError::WitnessProgramMismatch));
+            }
+            Ok(())
+        })
     }
 
     fn verify_taproot_key_path(&mut self, program: &[u8], signature: Vec<u8>) -> Result<(), Error> {
@@ -1841,8 +1837,10 @@ impl<'tx, 'script> Interpreter<'tx, 'script> {
             .taproot_signature_hash(self.input_index, &prevouts, annex, leaf_hash, sighash_type)
             .map_err(|_| self.fail(ScriptError::SchnorrSigHashType))?;
         let message = <Message as From<_>>::from(sighash);
-        let secp = Secp256k1::verification_only();
-        Ok(secp.verify_schnorr(signature, &message, pubkey).is_ok())
+        let is_valid = with_secp256k1_verification_ctx(|secp| {
+            secp.verify_schnorr(signature, &message, pubkey).is_ok()
+        });
+        Ok(is_valid)
     }
 
     fn verify_ecdsa_signature(

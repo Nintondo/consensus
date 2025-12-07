@@ -108,17 +108,6 @@ fn bitcoin_core_script_vectors() {
             flags,
         );
 
-        if index == 612 {
-            eprintln!(
-                "debug vector 612: result={:?} scriptSigBytes={:x?} scriptSig=`{}` scriptPubKey=`{}` flags={}",
-                result,
-                script_sig.as_bytes(),
-                script_sig_str,
-                script_pubkey_str,
-                flags_str
-            );
-        }
-
         match expected_error {
             None => {
                 if let Err(failure) = result {
@@ -156,7 +145,6 @@ fn run_vector_case(
     amount: u64,
     flags: u32,
 ) -> Result<(), ScriptFailure> {
-    let log_truncated_sig = script_sig.as_bytes() == [0x4c, 0x01];
     let credit_tx = Transaction {
         version: Version(1),
         lock_time: LockTime::ZERO,
@@ -191,13 +179,6 @@ fn run_vector_case(
     };
 
     let tx_bytes = btc_consensus::serialize(&tx);
-    if log_truncated_sig {
-        let hex = tx_bytes
-            .iter()
-            .map(|b| format!("{:02x}", b))
-            .collect::<String>();
-        eprintln!("debug tx bytes for truncated scriptSig: {hex}");
-    }
     let script_storage: Option<Vec<u8>> = if flags & VERIFY_TAPROOT != 0 {
         Some(script_pubkey.as_bytes().to_vec())
     } else {

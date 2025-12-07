@@ -1,10 +1,12 @@
 #![cfg_attr(not(feature = "std"), no_std)]
-
 //! Pure-Rust implementation of the `libbitcoinconsensus` API surface.
 //!
 //! The goal of this crate is to faithfully reproduce the behaviour of
 //! Bitcoin Core's consensus verification logic in Rust without relying on
 //! the original C++ implementation.
+
+#[cfg(all(feature = "external-secp", not(feature = "std")))]
+compile_error!("The `external-secp` feature requires `std` because it relies on the global secp256k1 context.");
 
 #[cfg(not(feature = "std"))]
 extern crate alloc;
@@ -1365,6 +1367,66 @@ mod tests {
     }
 
     #[test]
+    fn verify_p2wsh_cleanstack_enforced() {
+        let witness_script = Builder::new()
+            .push_opcode(all::OP_PUSHNUM_1)
+            .push_opcode(all::OP_PUSHNUM_1)
+            .into_script();
+        let program = sha256::Hash::hash(witness_script.as_bytes());
+        let script_pubkey = Builder::new()
+            .push_opcode(all::OP_PUSHBYTES_0)
+            .push_slice(PushBytesBuf::try_from(program.to_byte_array().to_vec()).unwrap())
+            .into_script();
+        let witness = Witness::from(vec![witness_script.as_bytes().to_vec()]);
+
+        let failure = run_witness_script_with_ctx(
+            Builder::new().into_script(),
+            script_pubkey,
+            witness,
+            Amount::from_sat(50_000),
+            VERIFY_WITNESS,
+        )
+        .expect_err("witness scripts must leave exactly one stack item");
+        assert_eq!(failure.script_error, ScriptError::CleanStack);
+    }
+
+    #[test]
+    fn verify_p2sh_p2wsh_cleanstack_enforced() {
+        let witness_script = Builder::new()
+            .push_opcode(all::OP_PUSHNUM_1)
+            .push_opcode(all::OP_PUSHNUM_1)
+            .into_script();
+        let program = sha256::Hash::hash(witness_script.as_bytes());
+        let redeem_script = Builder::new()
+            .push_opcode(all::OP_PUSHBYTES_0)
+            .push_slice(PushBytesBuf::try_from(program.to_byte_array().to_vec()).unwrap())
+            .into_script();
+        let redeem_bytes = redeem_script.as_bytes().to_vec();
+        let script_sig = Builder::new()
+            .push_slice(PushBytesBuf::try_from(redeem_bytes.clone()).unwrap())
+            .into_script();
+        let script_pubkey = Builder::new()
+            .push_opcode(all::OP_HASH160)
+            .push_slice(
+                PushBytesBuf::try_from(hash160::Hash::hash(&redeem_bytes).to_byte_array().to_vec())
+                    .unwrap(),
+            )
+            .push_opcode(all::OP_EQUAL)
+            .into_script();
+        let witness = Witness::from(vec![witness_script.as_bytes().to_vec()]);
+
+        let failure = run_witness_script_with_ctx(
+            script_sig,
+            script_pubkey,
+            witness,
+            Amount::from_sat(50_000),
+            VERIFY_WITNESS | VERIFY_P2SH,
+        )
+        .expect_err("p2sh-wrapped witnesses must also leave a clean stack");
+        assert_eq!(failure.script_error, ScriptError::CleanStack);
+    }
+
+    #[test]
     fn verify_witness_malleated_p2sh() {
         let inner_script = Builder::new().push_opcode(all::OP_PUSHNUM_1).into_script();
         let program = sha256::Hash::hash(inner_script.as_bytes());
@@ -1697,11 +1759,7 @@ mod tests {
             })
             .collect();
 
-        let satisfied_stack = vec![
-            signatures[2].clone(),
-            Vec::new(),
-            signatures[0].clone(),
-        ];
+        let satisfied_stack = vec![signatures[2].clone(), Vec::new(), signatures[0].clone()];
         let witness = taproot_witness_from_template(satisfied_stack, &template);
         run_taproot_verification(
             spent_script.clone(),
@@ -1712,12 +1770,9 @@ mod tests {
 
         let unsatisfied_stack = vec![Vec::new(), Vec::new(), signatures[0].clone()];
         let witness = taproot_witness_from_template(unsatisfied_stack, &template);
-        let err = run_taproot_verification(
-            spent_script,
-            witness,
-            VERIFY_TAPROOT | VERIFY_CLEANSTACK,
-        )
-        .expect_err("threshold unmet should fail");
+        let err =
+            run_taproot_verification(spent_script, witness, VERIFY_TAPROOT | VERIFY_CLEANSTACK)
+                .expect_err("threshold unmet should fail");
         assert_eq!(err, ScriptError::EvalFalse);
     }
 
