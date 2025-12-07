@@ -13,10 +13,13 @@ categories = ["cryptography", "science::cryptography"]
 default = ["std"]
 std = ["bitcoin/std"]
 external-secp = ["std", "dep:secp256k1", "secp256k1/global-context"]
+core-diff = ["std", "dep:bitcoinconsensus"]
 
 [dependencies]
-bitcoin = { version = "0.32.7", default-features = false }
-secp256k1 = { version = "0.29.1", default-features = false, optional = true }
+bitcoin = { version = "0.32.8", default-features = false }
+secp256k1 = { version = "0.31.1", default-features = false, optional = true }
+bitcoinconsensus = { git = "https://github.com/rust-bitcoin/rust-bitcoinconsensus", rev = "ca6b5316b58c62d1abe83517d705fdcfb555a1a6", optional = true, default-features = true }
 
 [dev-dependencies]
-serde_json = "1.0"
+serde_json = "1.0.145"
+proptest = "1.9.0"

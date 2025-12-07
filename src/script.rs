@@ -6,10 +6,10 @@
 
 #[cfg(not(feature = "std"))]
 use alloc::{vec, vec::Vec};
-#[cfg(feature = "std")]
-use std::vec::Vec;
 #[cfg(all(feature = "std", not(feature = "external-secp")))]
 use std::sync::OnceLock;
+#[cfg(feature = "std")]
+use std::vec::Vec;
 
 use core::mem;
 
@@ -292,6 +292,30 @@ impl ScriptStack {
     }
 }
 
+/// Input-specific data required to run the interpreter.
+pub struct SpendContext<'script> {
+    pub script_pubkey: &'script [u8],
+    pub spent_outputs: Option<SpentOutputs>,
+    pub amount: u64,
+    pub has_amount: bool,
+}
+
+impl<'script> SpendContext<'script> {
+    pub fn new(
+        script_pubkey: &'script [u8],
+        spent_outputs: Option<SpentOutputs>,
+        amount: u64,
+        has_amount: bool,
+    ) -> Self {
+        Self {
+            script_pubkey,
+            spent_outputs,
+            amount,
+            has_amount,
+        }
+    }
+}
+
 /// High-level script verification context.
 pub struct Interpreter<'tx, 'script> {
     flags: ScriptFlags,
@@ -316,21 +340,25 @@ impl<'tx, 'script> Interpreter<'tx, 'script> {
         tx_ctx: &'tx TransactionContext,
         precomputed: PrecomputedTransactionData,
         input_index: usize,
-        spent_output_script: &'script [u8],
-        spent_outputs: Option<SpentOutputs>,
-        amount: u64,
-        has_amount: bool,
+        spend: SpendContext<'script>,
         flags: ScriptFlags,
     ) -> Result<Self, Error> {
-        if flags.requires_spent_outputs() && spent_outputs.is_none() {
+        if flags.requires_spent_outputs() && spend.spent_outputs.is_none() {
             return Err(Error::ERR_SPENT_OUTPUTS_REQUIRED);
         }
+
+        let SpendContext {
+            script_pubkey,
+            spent_outputs,
+            amount,
+            has_amount,
+        } = spend;
 
         Ok(Self {
             flags,
             amount,
             has_amount,
-            spent_output_script,
+            spent_output_script: script_pubkey,
             spent_outputs,
             tx_ctx,
             _precomputed: precomputed,
@@ -358,10 +386,12 @@ impl<'tx, 'script> Interpreter<'tx, 'script> {
         let witness_enabled = self.flags.bits() & VERIFY_WITNESS != 0;
         let p2sh_enabled = self.flags.bits() & VERIFY_P2SH != 0;
         let spent_is_p2sh = is_p2sh(self.spent_output_script);
-        if witness_enabled && spent_is_p2sh && !txin.witness.is_empty() {
-            if !is_canonical_single_push(txin.script_sig.as_bytes()) {
-                return Err(self.fail(ScriptError::WitnessMalleatedP2SH));
-            }
+        if witness_enabled
+            && spent_is_p2sh
+            && !txin.witness.is_empty()
+            && !is_canonical_single_push(txin.script_sig.as_bytes())
+        {
+            return Err(self.fail(ScriptError::WitnessMalleatedP2SH));
         }
         if self.flags.bits() & VERIFY_SIGPUSHONLY != 0 && !is_push_only(txin.script_sig.as_bytes())
         {
@@ -1545,7 +1575,7 @@ impl<'tx, 'script> Interpreter<'tx, 'script> {
             return Ok(());
         }
 
-        if witness.len() == 0 {
+        if witness.is_empty() {
             return Err(self.fail(ScriptError::WitnessProgramWitnessEmpty));
         }
 
@@ -1632,7 +1662,8 @@ impl<'tx, 'script> Interpreter<'tx, 'script> {
     fn validate_control_block(&mut self, control: &[u8]) -> Result<(), Error> {
         if control.len() < TAPROOT_CONTROL_BASE_SIZE
             || control.len() > TAPROOT_CONTROL_MAX_SIZE
-            || (control.len() - TAPROOT_CONTROL_BASE_SIZE) % TAPROOT_CONTROL_NODE_SIZE != 0
+            || !(control.len() - TAPROOT_CONTROL_BASE_SIZE)
+                .is_multiple_of(TAPROOT_CONTROL_NODE_SIZE)
         {
             return Err(self.fail(ScriptError::TaprootWrongControlSize));
         }
@@ -1727,7 +1758,7 @@ impl<'tx, 'script> Interpreter<'tx, 'script> {
     }
 
     fn verify_p2wsh(&mut self, program: &[u8], witness: &Witness) -> Result<(), Error> {
-        if witness.len() < 1 {
+        if witness.is_empty() {
             return Err(self.fail(ScriptError::WitnessProgramWitnessEmpty));
         }
 
@@ -1927,7 +1958,7 @@ fn encode_num(value: i64) -> Vec<u8> {
     }
 
     let mut result = Vec::new();
-    let mut abs_value = value.abs() as u64;
+    let mut abs_value = value.unsigned_abs();
 
     while abs_value > 0 {
         result.push((abs_value & 0xff) as u8);
@@ -2160,7 +2191,7 @@ fn is_op_success(opcode: Opcode) -> bool {
 
 fn count_sigops_bytes(script_bytes: &[u8], accurate: bool) -> Result<u32, Error> {
     let script = Script::from_bytes(script_bytes);
-    count_sigops(&script, accurate)
+    count_sigops(script, accurate)
 }
 
 fn count_sigops(script: &Script, accurate: bool) -> Result<u32, Error> {
@@ -2262,7 +2293,7 @@ fn is_defined_hashtype_signature(sig: &[u8]) -> bool {
         return false;
     }
     let base = sig[sig.len() - 1] & 0x1f;
-    matches!(base, 0x01 | 0x02 | 0x03)
+    matches!(base, 0x01..=0x03)
 }
 
 fn is_low_der_signature(sig: &[u8]) -> bool {

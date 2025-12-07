@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 9e99809c277360fb1ed4ca6a1f7efee6e3c2a86cc4c9dd2753d9f868c59cc78e # shrinks to case = RandomCase { script_pubkey: Script(OP_HASH160 OP_PUSHBYTES_20 cf527a41c9908b23b16f854a15f2b4ecb18d8a71 OP_EQUAL), amount: 0, flags: 0x4001 }

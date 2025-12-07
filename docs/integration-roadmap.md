@@ -95,7 +95,8 @@ Exit criteria: Taproot spends (key and script paths) verify identically to Core 
 
 1. **Fuzzing & Differential Testing**  
    - Wire honggfuzz/AFL targets comparing our interpreter output to Core via RPC/FFI harness.  
-   - Add random-script/property tests to catch edge cases.
+   - ✅ Added a `proptest`-powered random script differential in `tests/random_consistency.rs` (behind `core-diff`). Each property run synthesizes arbitrary scriptSig/scriptPubKey pairs, executes them through our engine and `libbitcoinconsensus`, and asserts the results match, giving us broad coverage beyond the static Core vectors.  
+   - New: `cargo test --features core-diff` now replays Bitcoin Core’s `script_tests.json` through both this crate and `libbitcoinconsensus` (via the `bitcoinconsensus` crate) and asserts that both agree on every non-Taproot vector. This gives us a ready-made differential harness while we work toward fuzzing support.
 
 2. **Performance / Memory Profiling**  
    - Benchmark against Core for representative workloads; optimize stack handling, sighash caching, and script parsing.  

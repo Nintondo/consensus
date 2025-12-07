@@ -6,7 +6,9 @@
 //! the original C++ implementation.
 
 #[cfg(all(feature = "external-secp", not(feature = "std")))]
-compile_error!("The `external-secp` feature requires `std` because it relies on the global secp256k1 context.");
+compile_error!(
+    "The `external-secp` feature requires `std` because it relies on the global secp256k1 context."
+);
 
 #[cfg(not(feature = "std"))]
 extern crate alloc;
@@ -20,7 +22,7 @@ pub use script::ScriptError;
 use core::fmt;
 
 use crate::{
-    script::{Interpreter, ScriptFlags},
+    script::{Interpreter, ScriptFlags, SpendContext},
     tx::{SpentOutputs, TransactionContext},
     types::{c_int64, c_uchar, c_uint},
 };
@@ -254,20 +256,12 @@ fn perform_verification(
     let amount = derived_amount.unwrap_or(amount);
     let has_amount = derived_amount.is_some() || explicit_amount_known;
     let precomputed = tx_ctx.build_precomputed(spent_outputs.as_ref(), false);
-    let mut interpreter = Interpreter::new(
-        &tx_ctx,
-        precomputed,
-        input_index,
-        spent_output_script,
-        spent_outputs,
-        amount,
-        has_amount,
-        flags,
-    )
-    .map_err(|err| ScriptFailure {
-        error: err,
-        script_error: ScriptError::Ok,
-    })?;
+    let spend_context = SpendContext::new(spent_output_script, spent_outputs, amount, has_amount);
+    let mut interpreter = Interpreter::new(&tx_ctx, precomputed, input_index, spend_context, flags)
+        .map_err(|err| ScriptFailure {
+            error: err,
+            script_error: ScriptError::Ok,
+        })?;
 
     interpreter.verify().map_err(|err| ScriptFailure {
         error: err,
@@ -336,7 +330,7 @@ impl std::error::Error for Error {}
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::script::{Interpreter, ScriptFlags};
+    use crate::script::{Interpreter, ScriptFlags, SpendContext};
     use crate::tx::SpentOutputs;
     use crate::tx::TransactionContext;
     use crate::Utxo;
@@ -926,7 +920,7 @@ mod tests {
 
         let mut tx = multisig_test_transaction();
         let mut sig = sign_input(&secp, &tx, &spent_script, &sk);
-        corrupt_signature(&mut sig);
+        corrupt_signature(sig.as_mut_slice());
         let script_sig = Builder::new()
             .push_slice(PushBytesBuf::try_from(sig.clone()).unwrap())
             .into_script();
@@ -977,9 +971,9 @@ mod tests {
 
         let tx = multisig_test_transaction();
         let mut bad_sig1 = sign_input(&secp, &tx, &spent_script, &sk1);
-        corrupt_signature(&mut bad_sig1);
+        corrupt_signature(bad_sig1.as_mut_slice());
         let mut bad_sig2 = sign_input(&secp, &tx, &spent_script, &sk2);
-        corrupt_signature(&mut bad_sig2);
+        corrupt_signature(bad_sig2.as_mut_slice());
 
         let script_sig = Builder::new()
             .push_opcode(all::OP_PUSHBYTES_0)
@@ -1836,9 +1830,7 @@ mod tests {
         let (spent_script, template) =
             taproot_script_fixture(TAPROOT_LEAF_TAPSCRIPT, script, Vec::new(), false);
         let sig = vec![0x01];
-        let mut stack_items = Vec::with_capacity(2);
-        stack_items.push(sig.clone());
-        stack_items.push(vec![0x02; 33]);
+        let stack_items = vec![sig.clone(), vec![0x02; 33]];
         let witness = taproot_witness_from_template(stack_items, &template);
         run_taproot_verification(spent_script.clone(), witness.clone(), VERIFY_TAPROOT)
             .expect("unknown pubkey type permitted without flag");
@@ -2007,17 +1999,10 @@ mod tests {
         let spent_outputs = SpentOutputs::new(1, &utxos).unwrap();
         let script_flags = ScriptFlags::from_bits(flags).unwrap();
         let precomputed = tx_ctx.build_precomputed(Some(&spent_outputs), false);
-        let mut interpreter = Interpreter::new(
-            &tx_ctx,
-            precomputed,
-            0,
-            spent_script.as_bytes(),
-            Some(spent_outputs),
-            amount.to_sat(),
-            true,
-            script_flags,
-        )
-        .unwrap();
+        let spend_context =
+            SpendContext::new(spent_script.as_bytes(), Some(spent_outputs), amount.to_sat(), true);
+        let mut interpreter =
+            Interpreter::new(&tx_ctx, precomputed, 0, spend_context, script_flags).unwrap();
 
         match interpreter.verify() {
             Ok(()) => Ok(()),
@@ -2419,7 +2404,7 @@ mod tests {
         bytes
     }
 
-    fn corrupt_signature(sig: &mut Vec<u8>) {
+    fn corrupt_signature(sig: &mut [u8]) {
         if sig.len() > 3 {
             let idx = sig.len() - 3;
             sig[idx] ^= 0x01;

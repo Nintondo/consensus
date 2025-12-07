@@ -20,6 +20,8 @@ use consensus::{
     VERIFY_MINIMALIF, VERIFY_NULLDUMMY, VERIFY_NULLFAIL, VERIFY_P2SH, VERIFY_SIGPUSHONLY,
     VERIFY_STRICTENC, VERIFY_TAPROOT, VERIFY_WITNESS, VERIFY_WITNESS_PUBKEYTYPE,
 };
+#[cfg(feature = "core-diff")]
+use consensus::VERIFY_CHECKLOCKTIMEVERIFY;
 use script_asm::{parse_script, ParseScriptError};
 use serde_json::Value;
 use std::fmt;
@@ -100,13 +102,59 @@ fn bitcoin_core_script_vectors() {
         let expected_error = parse_expected_error(expected_error_str)
             .unwrap_or_else(|| panic!("unknown expected error `{expected_error_str}`"));
 
-        let result = run_vector_case(
-            script_sig.clone(),
-            script_pubkey.clone(),
-            witness.clone(),
-            amount,
-            flags,
-        );
+        let tx_bytes = build_test_transaction(&script_pubkey, &script_sig, witness.clone(), amount);
+        let script_storage: Option<Vec<u8>> = if flags & VERIFY_TAPROOT != 0 {
+            Some(script_pubkey.as_bytes().to_vec())
+        } else {
+            None
+        };
+        let utxo_storage: Option<Vec<Utxo>> = script_storage.as_ref().map(|storage| {
+            vec![Utxo {
+                script_pubkey: storage.as_ptr(),
+                script_pubkey_len: storage.len() as u32,
+                value: amount as i64,
+            }]
+        });
+        #[cfg(feature = "core-diff")]
+        let core_utxo_storage: Option<Vec<bitcoinconsensus::Utxo>> =
+            script_storage.as_ref().map(|storage| {
+                vec![bitcoinconsensus::Utxo {
+                    script_pubkey: storage.as_ptr(),
+                    script_pubkey_len: storage.len() as u32,
+                    value: amount as i64,
+                }]
+            });
+        let spent_slice = utxo_storage.as_deref();
+        let result = run_vector_case(&script_pubkey, amount, flags, &tx_bytes, spent_slice);
+
+        #[cfg(feature = "core-diff")]
+        {
+            let core_spent_slice = core_utxo_storage.as_deref();
+            const LIBCONSENSUS_SUPPORTED_FLAGS: u32 = VERIFY_P2SH
+                | VERIFY_DERSIG
+                | VERIFY_NULLDUMMY
+                | VERIFY_CHECKLOCKTIMEVERIFY
+                | VERIFY_CHECKSEQUENCEVERIFY
+                | VERIFY_WITNESS
+                | VERIFY_TAPROOT;
+
+            if flags & !LIBCONSENSUS_SUPPORTED_FLAGS == 0 {
+                let ours_ok = result.is_ok();
+                let core_res = bitcoinconsensus::verify_with_flags(
+                    script_pubkey.as_bytes(),
+                    amount,
+                    &tx_bytes,
+                    core_spent_slice,
+                    0,
+                    flags,
+                );
+                let core_ok = core_res.is_ok();
+                assert!(
+                    ours_ok == core_ok,
+                    "vector #{index} diverged between Rust and libbitcoinconsensus (scriptSig=`{script_sig_str}`, scriptPubKey=`{script_pubkey_str}`, flags={flags_str}, core_result={core_res:?})"
+                );
+            }
+        }
 
         match expected_error {
             None => {
@@ -139,12 +187,28 @@ fn panic_parse(index: usize, err: ParseScriptError, asm: &str) -> ! {
 }
 
 fn run_vector_case(
-    script_sig: ScriptBuf,
-    script_pubkey: ScriptBuf,
-    witness: Witness,
+    script_pubkey: &ScriptBuf,
     amount: u64,
     flags: u32,
+    tx_bytes: &[u8],
+    spent_slice: Option<&[Utxo]>,
 ) -> Result<(), ScriptFailure> {
+    verify_with_flags_detailed(
+        script_pubkey.as_bytes(),
+        amount,
+        tx_bytes,
+        spent_slice,
+        0,
+        flags,
+    )
+}
+
+fn build_test_transaction(
+    script_pubkey: &ScriptBuf,
+    script_sig: &ScriptBuf,
+    witness: Witness,
+    amount: u64,
+) -> Vec<u8> {
     let credit_tx = Transaction {
         version: Version(1),
         lock_time: LockTime::ZERO,
@@ -168,7 +232,7 @@ fn run_vector_case(
         lock_time: LockTime::ZERO,
         input: vec![TxIn {
             previous_output: prevout,
-            script_sig,
+            script_sig: script_sig.clone(),
             sequence: Sequence::MAX,
             witness,
         }],
@@ -177,29 +241,7 @@ fn run_vector_case(
             script_pubkey: ScriptBuf::new(),
         }],
     };
-
-    let tx_bytes = btc_consensus::serialize(&tx);
-    let script_storage: Option<Vec<u8>> = if flags & VERIFY_TAPROOT != 0 {
-        Some(script_pubkey.as_bytes().to_vec())
-    } else {
-        None
-    };
-    let utxo_storage: Option<Vec<Utxo>> = script_storage.as_ref().map(|storage| {
-        vec![Utxo {
-            script_pubkey: storage.as_ptr(),
-            script_pubkey_len: storage.len() as u32,
-            value: amount as i64,
-        }]
-    });
-    let spent_slice = utxo_storage.as_deref();
-    verify_with_flags_detailed(
-        script_pubkey.as_bytes(),
-        amount,
-        &tx_bytes,
-        spent_slice,
-        0,
-        flags,
-    )
+    btc_consensus::serialize(&tx)
 }
 
 fn parse_flags(raw: &str) -> Result<u32, FlagError> {
@@ -323,7 +365,7 @@ impl TaprootVectorContext {
         if self.spend_info.is_some() {
             return Err("taproot spend info already finalized".into());
         }
-        let builder = self.builder.take().unwrap_or_else(TaprootBuilder::new);
+        let builder = self.builder.take().unwrap_or_default();
         let updated = builder
             .add_leaf_with_ver(0, script.clone(), LeafVersion::TapScript)
             .map_err(|err| format!("taproot builder error: {err}"))?;
@@ -392,7 +434,7 @@ fn parse_amount_string(text: &str) -> Result<u64, String> {
     }
 
     let mut exponent = 0i32;
-    if let Some(pos) = s.find(|c| c == 'e' || c == 'E') {
+    if let Some(pos) = s.find(['e', 'E']) {
         let exp_part = s[pos + 1..].trim();
         if exp_part.is_empty() {
             return Err("amount exponent missing".into());

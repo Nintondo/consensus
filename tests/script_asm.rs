@@ -83,7 +83,7 @@ fn parse_decimal_i64(s: &str) -> Result<i64, ParseScriptError> {
 }
 
 fn is_hex(s: &str) -> bool {
-    !s.is_empty() && s.len() % 2 == 0 && s.bytes().all(|b| b.is_ascii_hexdigit())
+    !s.is_empty() && s.len().is_multiple_of(2) && s.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
 enum Token<'a> {
