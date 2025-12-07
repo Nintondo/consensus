@@ -1,0 +1,21 @@
+[package]
+name = "consensus"
+version = "0.1.0"
+edition = "2021"
+description = "Pure Rust implementation of Bitcoin's libbitcoinconsensus API"
+license = "MIT OR Apache-2.0"
+repository = ""
+homepage = ""
+keywords = ["bitcoin", "consensus", "libbitcoinconsensus"]
+categories = ["cryptography", "science::cryptography"]
+
+[features]
+default = ["std"]
+std = ["bitcoin/std"]
+external-secp = []
+
+[dependencies]
+bitcoin = { version = "0.32.7", default-features = false }
+
+[dev-dependencies]
+serde_json = "1.0"
