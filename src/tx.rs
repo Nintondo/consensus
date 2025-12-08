@@ -1,8 +1,4 @@
 //! Transaction parsing and data preparation utilities.
-//!
-//! The Bitcoin Core implementation relies on `PrecomputedTransactionData` together with the full
-//! set of spent outputs to evaluate signatures.  This module mirrors the same structures so that we
-//! can incrementally port the interpreter logic without deviating from upstream semantics.
 
 use core::slice;
 

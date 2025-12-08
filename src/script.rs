@@ -1,8 +1,4 @@
-//! Script interpreter scaffolding.
-//!
-//! This module currently only validates inputs and prepares the structures that the future
-//! interpreter will rely on.  It mirrors the shape of Bitcoin Core's `Interpreter` so that new
-//! functionality can be ported incrementally.
+//! Script interpreter.
 
 #[cfg(not(feature = "std"))]
 use alloc::{vec, vec::Vec};

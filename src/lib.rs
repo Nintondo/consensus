@@ -2,8 +2,7 @@
 //! Pure-Rust implementation of the `libbitcoinconsensus` API surface.
 //!
 //! The goal of this crate is to faithfully reproduce the behaviour of
-//! Bitcoin Core's consensus verification logic in Rust without relying on
-//! the original C++ implementation.
+//! Bitcoin Core's consensus verification logic in Rust.
 
 #[cfg(all(feature = "external-secp", not(feature = "std")))]
 compile_error!(
