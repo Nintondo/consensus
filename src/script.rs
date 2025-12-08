@@ -208,6 +208,7 @@ struct TaprootSignatureParts {
     sighash_type: TapSighashType,
 }
 
+#[derive(Default)]
 struct ExecutionData<'tx> {
     annex: Option<Annex<'tx>>,
     tapleaf_hash: Option<TapLeafHash>,
@@ -216,24 +217,13 @@ struct ExecutionData<'tx> {
     validation_weight_left: Option<i64>,
 }
 
-impl<'tx> Default for ExecutionData<'tx> {
-    fn default() -> Self {
-        Self {
-            annex: None,
-            tapleaf_hash: None,
-            leaf_version: None,
-            code_separator_pos: None,
-            validation_weight_left: None,
-        }
-    }
-}
-
 struct ControlBlock<'a> {
     bytes: &'a [u8],
 }
 
 impl<'a> ControlBlock<'a> {
     fn parse(bytes: &'a [u8]) -> Result<Self, ScriptError> {
+        #[allow(clippy::manual_is_multiple_of)]
         if bytes.len() < TAPROOT_CONTROL_BASE_SIZE
             || bytes.len() > TAPROOT_CONTROL_MAX_SIZE
             || (bytes.len() - TAPROOT_CONTROL_BASE_SIZE) % TAPROOT_CONTROL_NODE_SIZE != 0
@@ -647,7 +637,7 @@ impl<'tx, 'script> Interpreter<'tx, 'script> {
             cursor += 1;
             let should_execute = self.exec_stack.iter().all(|&cond| cond);
 
-            if opcode >= 0x01 && opcode <= 0x4b {
+            if (0x01..=0x4b).contains(&opcode) {
                 let push_len = opcode as usize;
                 if cursor + push_len > script_len {
                     return Err(self.fail(ScriptError::BadOpcode));
@@ -655,12 +645,13 @@ impl<'tx, 'script> Interpreter<'tx, 'script> {
                 if push_len > MAX_SCRIPT_ELEMENT_SIZE {
                     return Err(self.fail(ScriptError::PushSize));
                 }
+                if should_execute
+                    && self.flags.bits() & VERIFY_MINIMALDATA != 0
+                    && !is_minimal_push(opcode, &bytes[cursor..cursor + push_len])
+                {
+                    return Err(self.fail(ScriptError::MinimalData));
+                }
                 if should_execute {
-                    if self.flags.bits() & VERIFY_MINIMALDATA != 0 {
-                        if !is_minimal_push(opcode, &bytes[cursor..cursor + push_len]) {
-                            return Err(self.fail(ScriptError::MinimalData));
-                        }
-                    }
                     self.push_element(stack, bytes[cursor..cursor + push_len].to_vec())?;
                 }
                 cursor += push_len;
@@ -682,12 +673,13 @@ impl<'tx, 'script> Interpreter<'tx, 'script> {
                 if len_cursor + push_len > script_len {
                     return Err(self.fail(ScriptError::BadOpcode));
                 }
+                if should_execute
+                    && self.flags.bits() & VERIFY_MINIMALDATA != 0
+                    && !is_minimal_push(opcode, &bytes[len_cursor..len_cursor + push_len])
+                {
+                    return Err(self.fail(ScriptError::MinimalData));
+                }
                 if should_execute {
-                    if self.flags.bits() & VERIFY_MINIMALDATA != 0 {
-                        if !is_minimal_push(opcode, &bytes[len_cursor..len_cursor + push_len]) {
-                            return Err(self.fail(ScriptError::MinimalData));
-                        }
-                    }
                     self.push_element(
                         stack,
                         bytes[len_cursor..len_cursor + push_len].to_vec(),
@@ -1743,7 +1735,7 @@ impl<'tx, 'script> Interpreter<'tx, 'script> {
         let script = Script::from_bytes(script_bytes);
         stack_len -= 2;
         let leaf_version = control.leaf_version();
-        let tapleaf_hash = self.compute_tapleaf_hash(&script, leaf_version)?;
+        let tapleaf_hash = self.compute_tapleaf_hash(script, leaf_version)?;
         let merkle_root = self.compute_taproot_merkle_root(control.bytes(), tapleaf_hash)?;
         self.verify_taproot_commitment(program, control.bytes(), merkle_root)?;
         self.exec_data.tapleaf_hash = Some(tapleaf_hash);
