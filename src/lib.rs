@@ -66,6 +66,8 @@ pub const VERIFY_MINIMALIF: c_uint = 1 << 13;
 pub const VERIFY_NULLFAIL: c_uint = 1 << 14;
 /// Require compressed pubkeys in segwit v0 contexts.
 pub const VERIFY_WITNESS_PUBKEYTYPE: c_uint = 1 << 15;
+/// Make OP_CODESEPARATOR and signature find-and-delete fail in legacy scripts.
+pub const VERIFY_CONST_SCRIPTCODE: c_uint = 1 << 16;
 /// Enable TAPROOT (BIPs 341 & 342)
 pub const VERIFY_TAPROOT: c_uint = 1 << 17;
 
@@ -254,12 +256,13 @@ fn perform_verification(
     let explicit_amount_known = true;
     let amount = derived_amount.unwrap_or(amount);
     let has_amount = derived_amount.is_some() || explicit_amount_known;
-    let precomputed = tx_ctx.build_precomputed(spent_outputs.as_ref(), false);
     let spend_context = SpendContext::new(spent_output_script, spent_outputs, amount, has_amount);
-    let mut interpreter = Interpreter::new(&tx_ctx, precomputed, input_index, spend_context, flags)
-        .map_err(|err| ScriptFailure {
-            error: err,
-            script_error: ScriptError::Ok,
+    let mut interpreter =
+        Interpreter::new(&tx_ctx, input_index, spend_context, flags).map_err(|err| {
+            ScriptFailure {
+                error: err,
+                script_error: ScriptError::Ok,
+            }
         })?;
 
     interpreter.verify().map_err(|err| ScriptFailure {
@@ -337,7 +340,7 @@ mod tests {
         absolute::LockTime,
         blockdata::script::{Builder, PushBytesBuf, ScriptBuf},
         consensus::{self, Encodable},
-        hashes::{hash160, sha256, Hash, HashEngine},
+        hashes::{hash160, sha256, sha256d, Hash, HashEngine},
         hex::FromHex,
         key::{TapTweak, UntweakedPublicKey},
         opcodes::all,
@@ -345,12 +348,13 @@ mod tests {
             self, constants, ecdsa::Signature as EcdsaSignature, Keypair, Message, Parity,
             Secp256k1, SecretKey,
         },
-        sighash::{Annex, EcdsaSighashType, Prevouts, SegwitV0Sighash, SighashCache, TapSighashType},
+        sighash::{
+            Annex, EcdsaSighashType, Prevouts, SegwitV0Sighash, SighashCache, TapSighashType,
+        },
         taproot::{TapLeafHash, TapNodeHash, TAPROOT_ANNEX_PREFIX, TAPROOT_LEAF_TAPSCRIPT},
         transaction::Version,
         Amount, OutPoint, Sequence, Transaction, TxIn, TxOut, Witness,
     };
-
     #[test]
     fn height_flag_schedule_matches_bitcoin_core() {
         assert_eq!(height_to_flags(0), VERIFY_NONE);
@@ -1215,6 +1219,31 @@ mod tests {
     }
 
     #[test]
+    fn strictenc_rejects_high_bits_other_than_anyonecanpay() {
+        let secp = Secp256k1::new();
+        let sk = SecretKey::from_slice(&[70u8; 32]).unwrap();
+        let pk = bitcoin::secp256k1::PublicKey::from_secret_key(&secp, &sk);
+        let spent_script = Builder::new()
+            .push_slice(PushBytesBuf::try_from(pk.serialize().to_vec()).unwrap())
+            .push_opcode(all::OP_CHECKSIG)
+            .into_script();
+        let mut tx = multisig_test_transaction();
+        let mut sig = sign_input(&secp, &tx, &spent_script, &sk);
+        *sig.last_mut().expect("signature has hashtype") = 0x41;
+        tx.input[0].script_sig = push_data_script(&sig);
+
+        let failure = run_script_with_ctx_flags_detailed(
+            tx.input[0].script_sig.clone(),
+            spent_script,
+            LockTime::ZERO,
+            Sequence::MAX,
+            VERIFY_STRICTENC,
+        )
+        .expect_err("STRICTENC should reject non-standard high hashtype bits");
+        assert_eq!(failure.script_error, ScriptError::SigHashType);
+    }
+
+    #[test]
     fn witness_pubkeytype_requires_compressed_keys() {
         let secp = Secp256k1::new();
         let sk = SecretKey::from_slice(&[8u8; 32]).unwrap();
@@ -1274,6 +1303,204 @@ mod tests {
             VERIFY_WITNESS | VERIFY_WITNESS_PUBKEYTYPE,
         )
         .expect_err("uncompressed pubkey rejected when WITNESS_PUBKEYTYPE is enforced");
+    }
+
+    #[test]
+    fn witness_v0_keeps_op_codeseparator_in_script_code() {
+        let secp = Secp256k1::new();
+        let sk = SecretKey::from_slice(&[9u8; 32]).unwrap();
+        let pk = bitcoin::secp256k1::PublicKey::from_secret_key(&secp, &sk);
+        let witness_script = Builder::new()
+            .push_slice(PushBytesBuf::try_from(pk.serialize().to_vec()).unwrap())
+            .push_opcode(all::OP_CHECKSIG)
+            .push_opcode(all::OP_CODESEPARATOR)
+            .into_script();
+        let witness_script_bytes = witness_script.as_bytes().to_vec();
+        let program = sha256::Hash::hash(&witness_script_bytes);
+        let spent_script = Builder::new()
+            .push_opcode(all::OP_PUSHBYTES_0)
+            .push_slice(PushBytesBuf::try_from(program.to_byte_array().to_vec()).unwrap())
+            .into_script();
+        let amount = Amount::from_sat(50_000);
+        let mut tx = Transaction {
+            version: Version(2),
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint::default(),
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence::MAX,
+                witness: Witness::new(),
+            }],
+            output: vec![TxOut {
+                value: amount,
+                script_pubkey: ScriptBuf::new(),
+            }],
+        };
+        let sig = sign_witness_input(&secp, &tx, &witness_script, amount, &sk);
+        tx.input[0].witness = Witness::from(vec![sig, witness_script_bytes]);
+        let tx_bytes = consensus::serialize(&tx);
+
+        verify_with_flags(
+            spent_script.as_bytes(),
+            amount.to_sat(),
+            &tx_bytes,
+            None,
+            0,
+            VERIFY_WITNESS,
+        )
+        .expect("witness-v0 sighash must retain OP_CODESEPARATOR bytes");
+    }
+
+    #[cfg(feature = "core-diff")]
+    #[test]
+    fn core_diff_witness_v0_op_codeseparator_behavior_matches() {
+        let secp = Secp256k1::new();
+        let sk = SecretKey::from_slice(&[9u8; 32]).unwrap();
+        let pk = bitcoin::secp256k1::PublicKey::from_secret_key(&secp, &sk);
+        let witness_script = Builder::new()
+            .push_slice(PushBytesBuf::try_from(pk.serialize().to_vec()).unwrap())
+            .push_opcode(all::OP_CHECKSIG)
+            .push_opcode(all::OP_CODESEPARATOR)
+            .into_script();
+        let witness_script_bytes = witness_script.as_bytes().to_vec();
+        let program = sha256::Hash::hash(&witness_script_bytes);
+        let spent_script = Builder::new()
+            .push_opcode(all::OP_PUSHBYTES_0)
+            .push_slice(PushBytesBuf::try_from(program.to_byte_array().to_vec()).unwrap())
+            .into_script();
+        let amount = Amount::from_sat(50_000);
+        let mut tx = Transaction {
+            version: Version(2),
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint::default(),
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence::MAX,
+                witness: Witness::new(),
+            }],
+            output: vec![TxOut {
+                value: amount,
+                script_pubkey: ScriptBuf::new(),
+            }],
+        };
+        let sig = sign_witness_input(&secp, &tx, &witness_script, amount, &sk);
+        tx.input[0].witness = Witness::from(vec![sig, witness_script_bytes]);
+        let tx_bytes = consensus::serialize(&tx);
+
+        let flags = VERIFY_P2SH | VERIFY_WITNESS;
+        let ours = verify_with_flags(
+            spent_script.as_bytes(),
+            amount.to_sat(),
+            &tx_bytes,
+            None,
+            0,
+            flags,
+        );
+        let core = bitcoinconsensus::verify_with_flags(
+            spent_script.as_bytes(),
+            amount.to_sat(),
+            &tx_bytes,
+            None,
+            0,
+            flags,
+        );
+        assert_eq!(ours.is_ok(), core.is_ok());
+    }
+
+    #[test]
+    fn witness_v0_nonstandard_sighash_byte_is_not_normalized() {
+        let secp = Secp256k1::new();
+        let sk = SecretKey::from_slice(&[10u8; 32]).unwrap();
+        let pk = bitcoin::secp256k1::PublicKey::from_secret_key(&secp, &sk);
+        let witness_script = Builder::new().push_opcode(all::OP_CHECKSIG).into_script();
+        let witness_script_bytes = witness_script.as_bytes().to_vec();
+        let program = sha256::Hash::hash(&witness_script_bytes);
+        let spent_script = Builder::new()
+            .push_opcode(all::OP_PUSHBYTES_0)
+            .push_slice(PushBytesBuf::try_from(program.to_byte_array().to_vec()).unwrap())
+            .into_script();
+        let amount = Amount::from_sat(50_000);
+        let mut tx = Transaction {
+            version: Version(2),
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint::default(),
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence::MAX,
+                witness: Witness::new(),
+            }],
+            output: vec![TxOut {
+                value: amount,
+                script_pubkey: ScriptBuf::new(),
+            }],
+        };
+        let sig = sign_witness_input_with_hashtype(&secp, &tx, &witness_script, amount, &sk, 0x05);
+        tx.input[0].witness =
+            Witness::from(vec![sig, pk.serialize().to_vec(), witness_script_bytes]);
+        let tx_bytes = consensus::serialize(&tx);
+
+        verify_with_flags(
+            spent_script.as_bytes(),
+            amount.to_sat(),
+            &tx_bytes,
+            None,
+            0,
+            VERIFY_WITNESS,
+        )
+        .expect("witness-v0 must commit the raw hashtype byte in the BIP143 preimage");
+    }
+
+    #[cfg(feature = "core-diff")]
+    #[test]
+    fn core_diff_witness_v0_nonstandard_hashtype_matches() {
+        let secp = Secp256k1::new();
+        let sk = SecretKey::from_slice(&[10u8; 32]).unwrap();
+        let pk = bitcoin::secp256k1::PublicKey::from_secret_key(&secp, &sk);
+        let witness_script = Builder::new().push_opcode(all::OP_CHECKSIG).into_script();
+        let witness_script_bytes = witness_script.as_bytes().to_vec();
+        let program = sha256::Hash::hash(&witness_script_bytes);
+        let spent_script = Builder::new()
+            .push_opcode(all::OP_PUSHBYTES_0)
+            .push_slice(PushBytesBuf::try_from(program.to_byte_array().to_vec()).unwrap())
+            .into_script();
+        let amount = Amount::from_sat(50_000);
+        let mut tx = Transaction {
+            version: Version(2),
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint::default(),
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence::MAX,
+                witness: Witness::new(),
+            }],
+            output: vec![TxOut {
+                value: amount,
+                script_pubkey: ScriptBuf::new(),
+            }],
+        };
+        let sig = sign_witness_input_with_hashtype(&secp, &tx, &witness_script, amount, &sk, 0x05);
+        tx.input[0].witness =
+            Witness::from(vec![sig, pk.serialize().to_vec(), witness_script_bytes]);
+        let tx_bytes = consensus::serialize(&tx);
+
+        let flags = VERIFY_P2SH | VERIFY_WITNESS;
+        let ours = verify_with_flags(
+            spent_script.as_bytes(),
+            amount.to_sat(),
+            &tx_bytes,
+            None,
+            0,
+            flags,
+        );
+        let core = bitcoinconsensus::verify_with_flags(
+            spent_script.as_bytes(),
+            amount.to_sat(),
+            &tx_bytes,
+            None,
+            0,
+            flags,
+        );
+        assert_eq!(ours.is_ok(), core.is_ok());
     }
 
     #[test]
@@ -1642,11 +1869,7 @@ mod tests {
         let script = Builder::new().push_opcode(all::OP_CHECKSIG).into_script();
         let (spent_script, template) =
             taproot_script_fixture(TAPROOT_LEAF_TAPSCRIPT, script.clone(), Vec::new(), true);
-        let annex = template
-            .iter()
-            .last()
-            .expect("annex item")
-            .to_vec();
+        let annex = template.iter().last().expect("annex item").to_vec();
         let amount = Amount::from_sat(50_000);
 
         let sig_without_annex =
@@ -1667,8 +1890,10 @@ mod tests {
             amount,
             Some(&annex),
         );
-        let witness =
-            taproot_witness_from_template(vec![sig_with_annex, xonly.serialize().to_vec()], &template);
+        let witness = taproot_witness_from_template(
+            vec![sig_with_annex, xonly.serialize().to_vec()],
+            &template,
+        );
         run_taproot_verification(spent_script, witness, VERIFY_TAPROOT | VERIFY_CLEANSTACK)
             .expect("annex-aware tapscript signature validates");
     }
@@ -1738,9 +1963,12 @@ mod tests {
         let mut items: Vec<Vec<u8>> = witness.iter().map(|elem| elem.to_vec()).collect();
         let control = items.last_mut().expect("control block");
         control[40] ^= 0x01;
-        let err =
-            run_taproot_verification(spent_script, Witness::from(items), VERIFY_TAPROOT | VERIFY_CLEANSTACK)
-                .expect_err("bit-flipped control path invalidates commitment");
+        let err = run_taproot_verification(
+            spent_script,
+            Witness::from(items),
+            VERIFY_TAPROOT | VERIFY_CLEANSTACK,
+        )
+        .expect_err("bit-flipped control path invalidates commitment");
         assert_eq!(err, ScriptError::WitnessProgramMismatch);
     }
 
@@ -1867,8 +2095,7 @@ mod tests {
         let script = builder.push_opcode(all::OP_CHECKSIG).into_script();
         let (spent_script, template) =
             taproot_script_fixture(TAPROOT_LEAF_TAPSCRIPT, script, Vec::new(), false);
-        let witness =
-            taproot_witness_from_template(vec![vec![1], vec![0x02; 33]], &template);
+        let witness = taproot_witness_from_template(vec![vec![1], vec![0x02; 33]], &template);
         let err = run_taproot_verification(spent_script, witness, VERIFY_TAPROOT)
             .expect_err("non-empty sigs on upgradable pubkeys must still consume weight");
         assert_eq!(err, ScriptError::TapscriptValidationWeight);
@@ -2150,7 +2377,8 @@ mod tests {
         let tapleaf_hash = TapLeafHash::from_engine(engine);
         let mut merkle_root = TapNodeHash::from(tapleaf_hash);
         for node in merkle_path {
-            merkle_root = TapNodeHash::from_node_hashes(merkle_root, TapNodeHash::from_byte_array(*node));
+            merkle_root =
+                TapNodeHash::from_node_hashes(merkle_root, TapNodeHash::from_byte_array(*node));
         }
         let (tweaked, parity) = internal_key.tap_tweak(&secp, Some(merkle_root));
         let parity_bit = match parity {
@@ -2237,7 +2465,15 @@ mod tests {
         spent_script: &ScriptBuf,
         amount: Amount,
     ) -> Vec<u8> {
-        sign_tapscript_spend_with_annex(secp, keypair, script, spent_script, amount, None)
+        sign_tapscript_spend_with_annex_and_codesep(
+            secp,
+            keypair,
+            script,
+            spent_script,
+            amount,
+            None,
+            u32::MAX,
+        )
     }
 
     fn sign_tapscript_spend_with_annex(
@@ -2247,6 +2483,26 @@ mod tests {
         spent_script: &ScriptBuf,
         amount: Amount,
         annex_bytes: Option<&[u8]>,
+    ) -> Vec<u8> {
+        sign_tapscript_spend_with_annex_and_codesep(
+            secp,
+            keypair,
+            script,
+            spent_script,
+            amount,
+            annex_bytes,
+            u32::MAX,
+        )
+    }
+
+    fn sign_tapscript_spend_with_annex_and_codesep(
+        secp: &Secp256k1<secp256k1::All>,
+        keypair: &Keypair,
+        script: &ScriptBuf,
+        spent_script: &ScriptBuf,
+        amount: Amount,
+        annex_bytes: Option<&[u8]>,
+        code_separator_pos: u32,
     ) -> Vec<u8> {
         let tapleaf_hash = tapscript_leaf_hash(script, TAPROOT_LEAF_TAPSCRIPT);
         let tx = taproot_test_transaction(amount);
@@ -2262,7 +2518,7 @@ mod tests {
                 0,
                 &Prevouts::All(prevouts.as_slice()),
                 annex,
-                Some((tapleaf_hash, u32::MAX)),
+                Some((tapleaf_hash, code_separator_pos)),
                 TapSighashType::Default,
             )
             .expect("taproot sighash");
@@ -2305,6 +2561,11 @@ mod tests {
         witness: Witness,
         flags: u32,
     ) -> Result<(), ScriptError> {
+        let mut flags = flags;
+        if flags & VERIFY_TAPROOT != 0 {
+            // Taproot consensus execution requires the witness interpreter path.
+            flags |= VERIFY_WITNESS | VERIFY_P2SH;
+        }
         let amount = Amount::from_sat(50_000);
         let tx = Transaction {
             version: Version(2),
@@ -2332,15 +2593,13 @@ mod tests {
         let utxos = [utxo];
         let spent_outputs = SpentOutputs::new(1, &utxos).unwrap();
         let script_flags = ScriptFlags::from_bits(flags).unwrap();
-        let precomputed = tx_ctx.build_precomputed(Some(&spent_outputs), false);
         let spend_context = SpendContext::new(
             spent_script.as_bytes(),
             Some(spent_outputs),
             amount.to_sat(),
             true,
         );
-        let mut interpreter =
-            Interpreter::new(&tx_ctx, precomputed, 0, spend_context, script_flags).unwrap();
+        let mut interpreter = Interpreter::new(&tx_ctx, 0, spend_context, script_flags).unwrap();
 
         match interpreter.verify() {
             Ok(()) => Ok(()),
@@ -2493,6 +2752,415 @@ mod tests {
     }
 
     #[test]
+    fn verify_checksequenceverify_requires_version_two() {
+        let script_sig = Builder::new().into_script();
+        let spent_script = Builder::new()
+            .push_int(1)
+            .push_opcode(all::OP_CSV)
+            .push_opcode(all::OP_DROP)
+            .push_opcode(all::OP_PUSHNUM_1)
+            .into_script();
+
+        let failure = run_script_with_ctx_version_flags_detailed(
+            Version(1),
+            script_sig.clone(),
+            spent_script.clone(),
+            LockTime::ZERO,
+            Sequence(1),
+            VERIFY_CHECKSEQUENCEVERIFY,
+        )
+        .expect_err("csv must fail for tx version < 2");
+        assert_eq!(failure.script_error, ScriptError::UnsatisfiedLockTime);
+
+        run_script_with_ctx_version_flags_detailed(
+            Version(2),
+            script_sig,
+            spent_script,
+            LockTime::ZERO,
+            Sequence(1),
+            VERIFY_CHECKSEQUENCEVERIFY,
+        )
+        .expect("csv should pass once transaction version is >= 2");
+    }
+
+    #[test]
+    fn verify_checksequenceverify_masks_operands_larger_than_u32() {
+        let script_sig = Builder::new().into_script();
+        let sequence_bytes = PushBytesBuf::try_from(vec![0x00, 0x00, 0x00, 0x80, 0x01]).unwrap();
+        let spent_script = Builder::new()
+            .push_slice(sequence_bytes)
+            .push_opcode(all::OP_CSV)
+            .push_opcode(all::OP_DROP)
+            .push_opcode(all::OP_PUSHNUM_1)
+            .into_script();
+
+        run_script_with_ctx_version_flags_detailed(
+            Version(2),
+            script_sig,
+            spent_script,
+            LockTime::ZERO,
+            Sequence::ZERO,
+            VERIFY_CHECKSEQUENCEVERIFY,
+        )
+        .expect("csv should mask large operands instead of rejecting >u32");
+    }
+
+    #[test]
+    fn tapscript_codesep_uses_opcode_index() {
+        let secp = Secp256k1::new();
+        let keypair = Keypair::from_seckey_slice(&secp, &[41u8; 32]).unwrap();
+        let (xonly, _) = keypair.x_only_public_key();
+        let script = Builder::new()
+            .push_slice(PushBytesBuf::try_from(vec![0x42; 200]).unwrap())
+            .push_opcode(all::OP_DROP)
+            .push_opcode(all::OP_CODESEPARATOR)
+            .push_slice(PushBytesBuf::try_from(xonly.serialize().to_vec()).unwrap())
+            .push_opcode(all::OP_CHECKSIG)
+            .into_script();
+        let (spent_script, template) =
+            taproot_script_fixture(TAPROOT_LEAF_TAPSCRIPT, script.clone(), Vec::new(), false);
+        let amount = Amount::from_sat(50_000);
+
+        let sig_opcode_index = sign_tapscript_spend_with_annex_and_codesep(
+            &secp,
+            &keypair,
+            &script,
+            &spent_script,
+            amount,
+            None,
+            2,
+        );
+        let witness = taproot_witness_from_template(vec![sig_opcode_index], &template);
+        run_taproot_verification(
+            spent_script.clone(),
+            witness,
+            VERIFY_TAPROOT | VERIFY_CLEANSTACK,
+        )
+        .expect("tapscript signatures should use opcode-index codeseparator positions");
+
+        let sig_byte_offset = sign_tapscript_spend_with_annex_and_codesep(
+            &secp,
+            &keypair,
+            &script,
+            &spent_script,
+            amount,
+            None,
+            203,
+        );
+        let witness = taproot_witness_from_template(vec![sig_byte_offset], &template);
+        let err =
+            run_taproot_verification(spent_script, witness, VERIFY_TAPROOT | VERIFY_CLEANSTACK)
+                .expect_err("byte offsets must not be interpreted as codeseparator positions");
+        assert_eq!(err, ScriptError::EvalFalse);
+    }
+
+    #[test]
+    fn const_scriptcode_rejects_op_codeseparator_even_unexecuted() {
+        let script_sig = Builder::new().into_script();
+        let spent_script = Builder::new()
+            .push_opcode(all::OP_PUSHBYTES_0)
+            .push_opcode(all::OP_IF)
+            .push_opcode(all::OP_CODESEPARATOR)
+            .push_opcode(all::OP_ENDIF)
+            .push_opcode(all::OP_PUSHNUM_1)
+            .into_script();
+
+        run_script_with_ctx_flags(
+            script_sig.clone(),
+            spent_script.clone(),
+            LockTime::ZERO,
+            Sequence::MAX,
+            VERIFY_NONE,
+        )
+        .expect("without CONST_SCRIPTCODE, unexecuted OP_CODESEPARATOR is permitted");
+
+        let failure = run_script_with_ctx_flags_detailed(
+            script_sig,
+            spent_script,
+            LockTime::ZERO,
+            Sequence::MAX,
+            VERIFY_CONST_SCRIPTCODE,
+        )
+        .expect_err("CONST_SCRIPTCODE rejects OP_CODESEPARATOR in legacy scripts");
+        assert_eq!(failure.script_error, ScriptError::OpCodeSeparator);
+    }
+
+    #[test]
+    fn const_scriptcode_rejects_signature_find_and_delete() {
+        let secp = Secp256k1::new();
+        let sk = SecretKey::from_slice(&[9u8; 32]).unwrap();
+        let pk = bitcoin::secp256k1::PublicKey::from_secret_key(&secp, &sk);
+        let spent_script = Builder::new()
+            .push_opcode(all::OP_PUSHBYTES_0)
+            .push_slice(PushBytesBuf::try_from(pk.serialize().to_vec()).unwrap())
+            .push_opcode(all::OP_CHECKSIG)
+            .into_script();
+
+        let failure = run_script_with_ctx_flags_detailed(
+            Builder::new().into_script(),
+            spent_script,
+            LockTime::ZERO,
+            Sequence::MAX,
+            VERIFY_CONST_SCRIPTCODE,
+        )
+        .expect_err("CONST_SCRIPTCODE rejects legacy find-and-delete mutations");
+        assert_eq!(failure.script_error, ScriptError::SigFindAndDelete);
+    }
+
+    #[test]
+    fn const_scriptcode_checksig_findanddelete_precedes_sigder() {
+        let secp = Secp256k1::new();
+        let sk = SecretKey::from_slice(&[13u8; 32]).unwrap();
+        let pk = bitcoin::secp256k1::PublicKey::from_secret_key(&secp, &sk);
+        let bad_sig = vec![0x30, 0x00, 0x01];
+        let spent_script = Builder::new()
+            .push_slice(PushBytesBuf::try_from(bad_sig.clone()).unwrap())
+            .push_opcode(all::OP_DROP)
+            .push_slice(PushBytesBuf::try_from(pk.serialize().to_vec()).unwrap())
+            .push_opcode(all::OP_CHECKSIG)
+            .into_script();
+        let script_sig = push_data_script(&bad_sig);
+
+        let sig_der = run_script_with_ctx_flags_detailed(
+            script_sig.clone(),
+            spent_script.clone(),
+            LockTime::ZERO,
+            Sequence::MAX,
+            VERIFY_DERSIG,
+        )
+        .expect_err("without CONST_SCRIPTCODE malformed signature maps to SIG_DER");
+        assert_eq!(sig_der.script_error, ScriptError::SigDer);
+
+        let failure = run_script_with_ctx_flags_detailed(
+            script_sig,
+            spent_script,
+            LockTime::ZERO,
+            Sequence::MAX,
+            VERIFY_DERSIG | VERIFY_CONST_SCRIPTCODE,
+        )
+        .expect_err("CONST_SCRIPTCODE should fire before signature-encoding checks");
+        assert_eq!(failure.script_error, ScriptError::SigFindAndDelete);
+    }
+
+    #[test]
+    fn const_scriptcode_checkmultisig_findanddelete_precedes_sigder() {
+        let secp = Secp256k1::new();
+        let sk = SecretKey::from_slice(&[14u8; 32]).unwrap();
+        let pk = bitcoin::secp256k1::PublicKey::from_secret_key(&secp, &sk);
+        let bad_sig = vec![0x30, 0x00, 0x01];
+        let spent_script = Builder::new()
+            .push_slice(PushBytesBuf::try_from(bad_sig.clone()).unwrap())
+            .push_opcode(all::OP_DROP)
+            .push_opcode(all::OP_PUSHNUM_1)
+            .push_slice(PushBytesBuf::try_from(pk.serialize().to_vec()).unwrap())
+            .push_opcode(all::OP_PUSHNUM_1)
+            .push_opcode(all::OP_CHECKMULTISIG)
+            .into_script();
+        let script_sig = Builder::new()
+            .push_opcode(all::OP_PUSHBYTES_0)
+            .push_slice(PushBytesBuf::try_from(bad_sig).unwrap())
+            .into_script();
+
+        let sig_der = run_script_with_ctx_flags_detailed(
+            script_sig.clone(),
+            spent_script.clone(),
+            LockTime::ZERO,
+            Sequence::MAX,
+            VERIFY_DERSIG,
+        )
+        .expect_err("without CONST_SCRIPTCODE malformed multisig signature maps to SIG_DER");
+        assert_eq!(sig_der.script_error, ScriptError::SigDer);
+
+        let failure = run_script_with_ctx_flags_detailed(
+            script_sig,
+            spent_script,
+            LockTime::ZERO,
+            Sequence::MAX,
+            VERIFY_DERSIG | VERIFY_CONST_SCRIPTCODE,
+        )
+        .expect_err("CONST_SCRIPTCODE should fire before multisig signature-encoding checks");
+        assert_eq!(failure.script_error, ScriptError::SigFindAndDelete);
+    }
+
+    #[test]
+    fn pushdata_variants_match_direct_push_semantics() {
+        let direct = vec![0x01, 0x5a];
+        let pushdata1 = vec![all::OP_PUSHDATA1.to_u8(), 0x01, 0x5a];
+        let pushdata2 = vec![all::OP_PUSHDATA2.to_u8(), 0x01, 0x00, 0x5a];
+        let pushdata4 = vec![all::OP_PUSHDATA4.to_u8(), 0x01, 0x00, 0x00, 0x00, 0x5a];
+
+        for variant in [direct, pushdata1, pushdata2, pushdata4] {
+            let mut script = variant;
+            script.extend_from_slice(&[0x01, 0x5a, all::OP_EQUAL.to_u8()]);
+
+            run_script_with_ctx_flags_detailed(
+                ScriptBuf::new(),
+                ScriptBuf::from_bytes(script),
+                LockTime::ZERO,
+                Sequence::MAX,
+                VERIFY_NONE,
+            )
+            .expect("all pushdata forms must produce identical stack values");
+        }
+    }
+
+    #[test]
+    fn truncated_pushdata_scripts_fail_with_bad_opcode() {
+        let spent_script = Builder::new().push_opcode(all::OP_PUSHNUM_1).into_script();
+        for truncated in [
+            vec![all::OP_PUSHDATA1.to_u8(), 0x01],
+            vec![all::OP_PUSHDATA2.to_u8(), 0x01, 0x00],
+            vec![all::OP_PUSHDATA4.to_u8(), 0x01, 0x00, 0x00, 0x00],
+        ] {
+            let failure = run_script_with_ctx_flags_detailed(
+                ScriptBuf::from_bytes(truncated),
+                spent_script.clone(),
+                LockTime::ZERO,
+                Sequence::MAX,
+                VERIFY_NONE,
+            )
+            .expect_err("truncated pushdata opcode should fail");
+            assert_eq!(failure.script_error, ScriptError::BadOpcode);
+        }
+    }
+
+    #[test]
+    fn cltv_truncated_script_fails_with_invalid_stack_operation() {
+        let failure = run_script_with_ctx_flags_detailed(
+            ScriptBuf::new(),
+            Builder::new().push_opcode(all::OP_CLTV).into_script(),
+            LockTime::ZERO,
+            Sequence::MAX,
+            VERIFY_CHECKLOCKTIMEVERIFY,
+        )
+        .expect_err("OP_CHECKLOCKTIMEVERIFY requires an argument");
+        assert_eq!(failure.script_error, ScriptError::InvalidStackOperation);
+    }
+
+    #[test]
+    fn witness_only_does_not_imply_p2sh() {
+        let witness_script = Builder::new().push_opcode(all::OP_PUSHNUM_1).into_script();
+        let witness_script_bytes = witness_script.as_bytes().to_vec();
+        let redeem_hash = sha256::Hash::hash(&witness_script_bytes);
+        let redeem_script = Builder::new()
+            .push_opcode(all::OP_PUSHBYTES_0)
+            .push_slice(PushBytesBuf::try_from(redeem_hash.to_byte_array().to_vec()).unwrap())
+            .into_script();
+        let script_sig = push_data_script(redeem_script.as_bytes());
+        let witness = Witness::from(vec![witness_script_bytes]);
+        let spent_script = ScriptBuf::new_p2sh(&redeem_script.script_hash());
+        let tx = Transaction {
+            version: Version(2),
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint::default(),
+                script_sig,
+                sequence: Sequence::MAX,
+                witness,
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(0),
+                script_pubkey: ScriptBuf::new(),
+            }],
+        };
+        let tx_bytes = consensus::serialize(&tx);
+        let failure = verify_with_flags_detailed(
+            spent_script.as_bytes(),
+            0,
+            &tx_bytes,
+            None,
+            0,
+            VERIFY_WITNESS,
+        )
+        .expect_err("WITNESS-only should not behave like P2SH+WITNESS");
+        assert_eq!(failure.script_error, ScriptError::WitnessUnexpected);
+    }
+
+    #[test]
+    fn cleanstack_is_reported_before_witness_unexpected() {
+        let spent_script = Builder::new()
+            .push_opcode(all::OP_PUSHNUM_1)
+            .push_opcode(all::OP_PUSHNUM_1)
+            .into_script();
+        let tx = Transaction {
+            version: Version(2),
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint::default(),
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence::MAX,
+                witness: Witness::from(vec![vec![0x01]]),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(0),
+                script_pubkey: ScriptBuf::new(),
+            }],
+        };
+        let tx_bytes = consensus::serialize(&tx);
+        let failure = verify_with_flags_detailed(
+            spent_script.as_bytes(),
+            0,
+            &tx_bytes,
+            None,
+            0,
+            VERIFY_P2SH | VERIFY_WITNESS | VERIFY_CLEANSTACK,
+        )
+        .expect_err("clean stack must fail before witness-unexpected diagnostics");
+        assert_eq!(failure.script_error, ScriptError::CleanStack);
+    }
+
+    #[cfg(feature = "core-diff")]
+    #[test]
+    fn taproot_canonical_flags_match_core_behavior() {
+        let spent_script = Builder::new().push_opcode(all::OP_PUSHNUM_1).into_script();
+        let tx = Transaction {
+            version: Version(2),
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint::default(),
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence::MAX,
+                witness: Witness::from(vec![vec![0x01]]),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(0),
+                script_pubkey: ScriptBuf::new(),
+            }],
+        };
+        let tx_bytes = consensus::serialize(&tx);
+        let script_storage = spent_script.as_bytes().to_vec();
+        let ours_prevouts = [Utxo {
+            script_pubkey: script_storage.as_ptr(),
+            script_pubkey_len: script_storage.len() as u32,
+            value: 0,
+        }];
+        let core_prevouts = [bitcoinconsensus::Utxo {
+            script_pubkey: script_storage.as_ptr(),
+            script_pubkey_len: script_storage.len() as u32,
+            value: 0,
+        }];
+
+        let flags = VERIFY_P2SH | VERIFY_WITNESS | VERIFY_TAPROOT;
+        let ours = verify_with_flags_detailed(
+            spent_script.as_bytes(),
+            0,
+            &tx_bytes,
+            Some(&ours_prevouts),
+            0,
+            flags,
+        );
+        let core = bitcoinconsensus::verify_with_flags(
+            spent_script.as_bytes(),
+            0,
+            &tx_bytes,
+            Some(&core_prevouts),
+            0,
+            flags,
+        );
+        assert_eq!(ours.is_ok(), core.is_ok());
+    }
+
+    #[test]
     fn verify_script_size_limit_enforced() {
         let script_sig = Builder::new().into_script();
         let oversized = vec![all::OP_NOP.to_u8(); 10_001];
@@ -2636,8 +3304,26 @@ mod tests {
         sequence: Sequence,
         flags: u32,
     ) -> Result<(), ScriptFailure> {
+        run_script_with_ctx_version_flags_detailed(
+            Version(2),
+            script_sig,
+            script_pubkey,
+            lock_time,
+            sequence,
+            flags,
+        )
+    }
+
+    fn run_script_with_ctx_version_flags_detailed(
+        version: Version,
+        script_sig: ScriptBuf,
+        script_pubkey: ScriptBuf,
+        lock_time: LockTime,
+        sequence: Sequence,
+        flags: u32,
+    ) -> Result<(), ScriptFailure> {
         let tx = Transaction {
-            version: Version(2),
+            version,
             lock_time,
             input: vec![TxIn {
                 previous_output: OutPoint::default(),
@@ -2740,6 +3426,135 @@ mod tests {
         let mut bytes = sig.serialize_der().to_vec();
         bytes.push(EcdsaSighashType::All.to_u32() as u8);
         bytes
+    }
+
+    fn sign_witness_input_with_hashtype(
+        secp: &Secp256k1<secp256k1::All>,
+        tx: &Transaction,
+        script: &ScriptBuf,
+        amount: Amount,
+        sk: &SecretKey,
+        sighash_type: u8,
+    ) -> Vec<u8> {
+        let sighash = segwit_v0_signature_hash_raw(tx, 0, script, amount, sighash_type);
+        let message = Message::from_digest_slice(&sighash[..]).expect("hash to message");
+        let sig = secp.sign_ecdsa(&message, sk);
+        let mut bytes = sig.serialize_der().to_vec();
+        bytes.push(sighash_type);
+        bytes
+    }
+
+    fn segwit_v0_signature_hash_raw(
+        tx: &Transaction,
+        input_index: usize,
+        script_code: &ScriptBuf,
+        amount: Amount,
+        raw_sighash_type: u8,
+    ) -> SegwitV0Sighash {
+        const SIGHASH_ANYONECANPAY: u32 = 0x80;
+        const SIGHASH_BASE_MASK: u32 = 0x1f;
+        const SIGHASH_NONE: u32 = 0x02;
+        const SIGHASH_SINGLE: u32 = 0x03;
+
+        let hash_type = raw_sighash_type as u32;
+        let base_sighash = hash_type & SIGHASH_BASE_MASK;
+        let zero_hash = sha256d::Hash::all_zeros();
+
+        let hash_prevouts = if hash_type & SIGHASH_ANYONECANPAY == 0 {
+            hash_prevouts_double_sha(tx)
+        } else {
+            zero_hash
+        };
+
+        let hash_sequence = if hash_type & SIGHASH_ANYONECANPAY == 0
+            && base_sighash != SIGHASH_SINGLE
+            && base_sighash != SIGHASH_NONE
+        {
+            hash_sequences_double_sha(tx)
+        } else {
+            zero_hash
+        };
+
+        let hash_outputs = if base_sighash != SIGHASH_SINGLE && base_sighash != SIGHASH_NONE {
+            hash_outputs_double_sha(tx)
+        } else if base_sighash == SIGHASH_SINGLE && input_index < tx.output.len() {
+            hash_single_output_double_sha(&tx.output[input_index])
+        } else {
+            zero_hash
+        };
+
+        let txin = &tx.input[input_index];
+        let mut engine = SegwitV0Sighash::engine();
+        tx.version
+            .consensus_encode(&mut engine)
+            .expect("hash engine writes are infallible");
+        hash_prevouts
+            .consensus_encode(&mut engine)
+            .expect("hash engine writes are infallible");
+        hash_sequence
+            .consensus_encode(&mut engine)
+            .expect("hash engine writes are infallible");
+        txin.previous_output
+            .consensus_encode(&mut engine)
+            .expect("hash engine writes are infallible");
+        script_code
+            .consensus_encode(&mut engine)
+            .expect("hash engine writes are infallible");
+        amount
+            .consensus_encode(&mut engine)
+            .expect("hash engine writes are infallible");
+        txin.sequence
+            .consensus_encode(&mut engine)
+            .expect("hash engine writes are infallible");
+        hash_outputs
+            .consensus_encode(&mut engine)
+            .expect("hash engine writes are infallible");
+        tx.lock_time
+            .consensus_encode(&mut engine)
+            .expect("hash engine writes are infallible");
+        hash_type
+            .consensus_encode(&mut engine)
+            .expect("hash engine writes are infallible");
+
+        SegwitV0Sighash::from_engine(engine)
+    }
+
+    fn hash_prevouts_double_sha(tx: &Transaction) -> sha256d::Hash {
+        let mut engine = sha256d::Hash::engine();
+        for txin in &tx.input {
+            txin.previous_output
+                .consensus_encode(&mut engine)
+                .expect("hash engine writes are infallible");
+        }
+        sha256d::Hash::from_engine(engine)
+    }
+
+    fn hash_sequences_double_sha(tx: &Transaction) -> sha256d::Hash {
+        let mut engine = sha256d::Hash::engine();
+        for txin in &tx.input {
+            txin.sequence
+                .consensus_encode(&mut engine)
+                .expect("hash engine writes are infallible");
+        }
+        sha256d::Hash::from_engine(engine)
+    }
+
+    fn hash_outputs_double_sha(tx: &Transaction) -> sha256d::Hash {
+        let mut engine = sha256d::Hash::engine();
+        for txout in &tx.output {
+            txout
+                .consensus_encode(&mut engine)
+                .expect("hash engine writes are infallible");
+        }
+        sha256d::Hash::from_engine(engine)
+    }
+
+    fn hash_single_output_double_sha(output: &TxOut) -> sha256d::Hash {
+        let mut engine = sha256d::Hash::engine();
+        output
+            .consensus_encode(&mut engine)
+            .expect("hash engine writes are infallible");
+        sha256d::Hash::from_engine(engine)
     }
 
     fn corrupt_signature(sig: &mut [u8]) {

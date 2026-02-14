@@ -12,15 +12,15 @@ use bitcoin::{
     transaction::Version,
     Amount, OutPoint, ScriptBuf, Sequence, Transaction, TxIn, TxOut, Witness,
 };
-#[cfg(feature = "core-diff")]
-use consensus::VERIFY_CHECKLOCKTIMEVERIFY;
 use consensus::{
-    verify_with_flags_detailed, ScriptError, ScriptFailure, Utxo, VERIFY_CHECKSEQUENCEVERIFY,
-    VERIFY_CLEANSTACK, VERIFY_DERSIG, VERIFY_DISCOURAGE_OP_SUCCESS,
-    VERIFY_DISCOURAGE_UPGRADABLE_NOPS, VERIFY_DISCOURAGE_UPGRADABLE_TAPROOT_VERSION,
-    VERIFY_DISCOURAGE_UPGRADABLE_WITNESS_PROGRAM, VERIFY_LOW_S, VERIFY_MINIMALDATA,
-    VERIFY_MINIMALIF, VERIFY_NULLDUMMY, VERIFY_NULLFAIL, VERIFY_P2SH, VERIFY_SIGPUSHONLY,
-    VERIFY_STRICTENC, VERIFY_TAPROOT, VERIFY_WITNESS, VERIFY_WITNESS_PUBKEYTYPE,
+    verify_with_flags_detailed, ScriptError, ScriptFailure, Utxo, VERIFY_CHECKLOCKTIMEVERIFY,
+    VERIFY_CHECKSEQUENCEVERIFY, VERIFY_CLEANSTACK, VERIFY_CONST_SCRIPTCODE, VERIFY_DERSIG,
+    VERIFY_DISCOURAGE_OP_SUCCESS, VERIFY_DISCOURAGE_UPGRADABLE_NOPS,
+    VERIFY_DISCOURAGE_UPGRADABLE_PUBKEYTYPE,
+    VERIFY_DISCOURAGE_UPGRADABLE_TAPROOT_VERSION, VERIFY_DISCOURAGE_UPGRADABLE_WITNESS_PROGRAM,
+    VERIFY_LOW_S, VERIFY_MINIMALDATA, VERIFY_MINIMALIF, VERIFY_NULLDUMMY, VERIFY_NULLFAIL,
+    VERIFY_P2SH, VERIFY_SIGPUSHONLY, VERIFY_STRICTENC, VERIFY_TAPROOT, VERIFY_WITNESS,
+    VERIFY_WITNESS_PUBKEYTYPE,
 };
 use script_asm::{parse_script, ParseScriptError};
 use serde_json::Value;
@@ -138,7 +138,9 @@ fn bitcoin_core_script_vectors() {
                 | VERIFY_WITNESS
                 | VERIFY_TAPROOT;
 
-            if flags & !LIBCONSENSUS_SUPPORTED_FLAGS == 0 {
+            let canonical_combo = (flags & VERIFY_WITNESS == 0 || flags & VERIFY_P2SH != 0)
+                && (flags & VERIFY_TAPROOT == 0 || flags & VERIFY_WITNESS != 0);
+            if flags & !LIBCONSENSUS_SUPPORTED_FLAGS == 0 && canonical_combo {
                 let ours_ok = result.is_ok();
                 let core_res = bitcoinconsensus::verify_with_flags(
                     script_pubkey.as_bytes(),
@@ -257,10 +259,13 @@ fn parse_flags(raw: &str) -> Result<u32, FlagError> {
             "MINIMALDATA" => VERIFY_MINIMALDATA,
             "DISCOURAGE_UPGRADABLE_NOPS" => VERIFY_DISCOURAGE_UPGRADABLE_NOPS,
             "DISCOURAGE_UPGRADABLE_TAPROOT_VERSION" => VERIFY_DISCOURAGE_UPGRADABLE_TAPROOT_VERSION,
+            "DISCOURAGE_UPGRADABLE_PUBKEYTYPE" => VERIFY_DISCOURAGE_UPGRADABLE_PUBKEYTYPE,
             "DISCOURAGE_OP_SUCCESS" => VERIFY_DISCOURAGE_OP_SUCCESS,
             "TAPROOT" => VERIFY_TAPROOT,
             "CLEANSTACK" => VERIFY_CLEANSTACK,
+            "CHECKLOCKTIMEVERIFY" => VERIFY_CHECKLOCKTIMEVERIFY,
             "CHECKSEQUENCEVERIFY" => VERIFY_CHECKSEQUENCEVERIFY,
+            "CONST_SCRIPTCODE" => VERIFY_CONST_SCRIPTCODE,
             "WITNESS" => VERIFY_WITNESS,
             "MINIMALIF" => VERIFY_MINIMALIF,
             "NULLFAIL" => VERIFY_NULLFAIL,
@@ -523,6 +528,7 @@ fn parse_expected_error(raw: &str) -> Option<Option<ScriptError>> {
         "DISCOURAGE_UPGRADABLE_PUBKEYTYPE" => DiscourageUpgradablePubkeyType,
         "DISABLED_OPCODE" => DisabledOpcode,
         "BAD_OPCODE" => BadOpcode,
+        "OP_CODESEPARATOR" => OpCodeSeparator,
         "INVALID_STACK_OPERATION" => InvalidStackOperation,
         "INVALID_ALTSTACK_OPERATION" => InvalidAltstackOperation,
         "UNBALANCED_CONDITIONAL" => UnbalancedConditional,
@@ -539,6 +545,7 @@ fn parse_expected_error(raw: &str) -> Option<Option<ScriptError>> {
         "MINIMALIF" => MinimalIf,
         "TAPSCRIPT_MINIMALIF" => TapscriptMinimalIf,
         "NULLFAIL" => NullFail,
+        "SIG_FINDANDDELETE" => SigFindAndDelete,
         "WITNESS_PROGRAM_WRONG_LENGTH" => WitnessProgramWrongLength,
         "WITNESS_PROGRAM_WITNESS_EMPTY" => WitnessProgramWitnessEmpty,
         "WITNESS_PROGRAM_MISMATCH" => WitnessProgramMismatch,

@@ -14,9 +14,6 @@ use consensus::{
 };
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
 
-#[cfg(feature = "core-diff")]
-use bitcoinconsensus;
-
 struct BenchCase {
     name: &'static str,
     script_pubkey: Vec<u8>,

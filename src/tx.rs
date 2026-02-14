@@ -3,8 +3,8 @@
 use core::slice;
 
 use bitcoin::{
-    consensus,
-    hashes::{sha256, sha256d, Hash, HashEngine},
+    consensus::{self, Encodable},
+    hashes::{sha256, sha256d, Hash},
     opcodes::all::OP_PUSHNUM_1,
     script::ScriptBuf,
     Amount, Script, Transaction, TxOut,
@@ -24,11 +24,9 @@ pub struct TransactionContext {
 impl TransactionContext {
     /// Parses a transaction from wire bytes and reserializes it to guarantee canonical encoding.
     pub fn parse(tx_bytes: &[u8]) -> Result<Self, Error> {
-        let tx: Transaction =
-            consensus::deserialize(tx_bytes).map_err(|_| Error::ERR_TX_DESERIALIZE)?;
-
-        let canonical = consensus::serialize(&tx);
-        if canonical.len() != tx_bytes.len() {
+        let (tx, consumed): (Transaction, usize) =
+            consensus::deserialize_partial(tx_bytes).map_err(|_| Error::ERR_TX_DESERIALIZE)?;
+        if consumed != tx_bytes.len() {
             return Err(Error::ERR_TX_SIZE_MISMATCH);
         }
 
@@ -163,9 +161,9 @@ impl PrecomputedTransactionData {
         }
 
         if uses_bip143 {
-            data.hash_prevouts = data.prevouts_single_hash.map(double_sha);
-            data.hash_sequence = data.sequences_single_hash.map(double_sha);
-            data.hash_outputs = data.outputs_single_hash.map(double_sha);
+            data.hash_prevouts = Some(hash_prevouts_double(tx));
+            data.hash_sequence = Some(hash_sequences_double(tx));
+            data.hash_outputs = Some(hash_outputs_double(tx));
             data.bip143_segwit_ready = true;
         }
 
@@ -181,10 +179,6 @@ impl PrecomputedTransactionData {
     }
 }
 
-fn double_sha(hash: sha256::Hash) -> sha256d::Hash {
-    sha256d::Hash::hash(&hash.to_byte_array())
-}
-
 fn hash_prevouts_single(tx: &Transaction) -> sha256::Hash {
     hash_serialized(tx.input.iter().map(|input| &input.previous_output))
 }
@@ -197,11 +191,25 @@ fn hash_outputs_single(tx: &Transaction) -> sha256::Hash {
     hash_serialized(tx.output.iter())
 }
 
+fn hash_prevouts_double(tx: &Transaction) -> sha256d::Hash {
+    hash_serialized_double(tx.input.iter().map(|input| &input.previous_output))
+}
+
+fn hash_sequences_double(tx: &Transaction) -> sha256d::Hash {
+    hash_serialized_double(tx.input.iter().map(|input| &input.sequence))
+}
+
+fn hash_outputs_double(tx: &Transaction) -> sha256d::Hash {
+    hash_serialized_double(tx.output.iter())
+}
+
 fn hash_spent_amounts_single(spent: &SpentOutputs) -> sha256::Hash {
     let mut engine = sha256::Hash::engine();
     for txout in spent.txouts() {
         let value = txout.value.to_sat() as i64;
-        engine.input(&consensus::serialize(&value));
+        value
+            .consensus_encode(&mut engine)
+            .expect("hash engine writes are infallible");
     }
     sha256::Hash::from_engine(engine)
 }
@@ -217,9 +225,23 @@ where
 {
     let mut engine = sha256::Hash::engine();
     for item in items {
-        engine.input(&consensus::serialize(item));
+        item.consensus_encode(&mut engine)
+            .expect("hash engine writes are infallible");
     }
     sha256::Hash::from_engine(engine)
+}
+
+fn hash_serialized_double<'a, I, T>(items: I) -> sha256d::Hash
+where
+    I: IntoIterator<Item = &'a T>,
+    T: consensus::Encodable + 'a,
+{
+    let mut engine = sha256d::Hash::engine();
+    for item in items {
+        item.consensus_encode(&mut engine)
+            .expect("hash engine writes are infallible");
+    }
+    sha256d::Hash::from_engine(engine)
 }
 
 fn is_native_taproot(script: &Script) -> bool {

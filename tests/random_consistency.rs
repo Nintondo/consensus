@@ -12,11 +12,11 @@ use bitcoin::{
     taproot::{TapLeafHash, TapNodeHash, TAPROOT_LEAF_TAPSCRIPT},
     Amount, OutPoint, ScriptBuf, Sequence, Transaction, TxIn, TxOut, Witness,
 };
-use bitcoinconsensus;
 use consensus::{
     verify_with_flags_detailed, Utxo, VERIFY_CHECKLOCKTIMEVERIFY, VERIFY_CHECKSEQUENCEVERIFY,
-    VERIFY_DERSIG, VERIFY_MINIMALDATA, VERIFY_MINIMALIF, VERIFY_NONE, VERIFY_NULLDUMMY,
-    VERIFY_NULLFAIL, VERIFY_P2SH, VERIFY_STRICTENC, VERIFY_TAPROOT, VERIFY_WITNESS,
+    VERIFY_CONST_SCRIPTCODE, VERIFY_DERSIG, VERIFY_MINIMALDATA, VERIFY_MINIMALIF, VERIFY_NONE,
+    VERIFY_NULLDUMMY, VERIFY_NULLFAIL, VERIFY_P2SH, VERIFY_STRICTENC, VERIFY_TAPROOT,
+    VERIFY_WITNESS,
 };
 use proptest::prelude::*;
 use std::{fmt, slice};
@@ -27,6 +27,7 @@ const FLAG_SET: &[u32] = &[
     VERIFY_NULLDUMMY,
     VERIFY_CHECKLOCKTIMEVERIFY,
     VERIFY_CHECKSEQUENCEVERIFY,
+    VERIFY_CONST_SCRIPTCODE,
     VERIFY_WITNESS,
     VERIFY_STRICTENC,
     VERIFY_MINIMALDATA,
@@ -94,7 +95,9 @@ proptest! {
 }
 
 fn run_random_case(case: &RandomCase) {
-    if case.flags & !LIBCONSENSUS_SUPPORTED_FLAGS != 0 {
+    let canonical_combo = (case.flags & VERIFY_WITNESS == 0 || case.flags & VERIFY_P2SH != 0)
+        && (case.flags & VERIFY_TAPROOT == 0 || case.flags & VERIFY_WITNESS != 0);
+    if case.flags & !LIBCONSENSUS_SUPPORTED_FLAGS != 0 || !canonical_combo {
         // libbitcoinconsensus does not understand some policy-only bits; skip the differential
         // comparison for those inputs and only validate our interpreter.
         let _ = verify_with_flags_detailed(

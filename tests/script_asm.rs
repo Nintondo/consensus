@@ -10,7 +10,7 @@ use std::sync::OnceLock;
 #[derive(Debug)]
 pub enum ParseScriptError {
     BadDecimal(String),
-    DecimalOutOfRange(i64),
+    DecimalOutOfRange(i128),
     BadOpcode(String),
 }
 
@@ -37,6 +37,11 @@ fn core_opcode_map() -> &'static OpcodeMap {
 fn build_core_opcode_map() -> OpcodeMap {
     let mut map = HashMap::new();
     for byte in 0u8..=255 {
+        if byte == all::OP_CHECKSIGADD.to_u8() {
+            // Match Bitcoin Core's ParseScript token table, which intentionally
+            // excludes OP_CHECKSIGADD from textual parsing.
+            continue;
+        }
         let opcode = Opcode::from(byte);
         let name = match byte {
             0xb1 => "OP_CHECKLOCKTIMEVERIFY".into(),
@@ -72,14 +77,14 @@ fn is_all_digits(s: &str) -> bool {
 }
 
 fn parse_decimal_i64(s: &str) -> Result<i64, ParseScriptError> {
-    let num_i64 = s
+    let value = s
         .parse()
         .map_err(|_| ParseScriptError::BadDecimal(s.to_string()))?;
-    const LIM: i64 = 0xffff_ffff;
-    if !(-LIM..=LIM).contains(&num_i64) {
-        return Err(ParseScriptError::DecimalOutOfRange(num_i64));
+    const LIM: i128 = 0xffff_ffff;
+    if !(-LIM..=LIM).contains(&value) {
+        return Err(ParseScriptError::DecimalOutOfRange(value));
     }
-    Ok(num_i64)
+    Ok(value as i64)
 }
 
 fn is_hex(s: &str) -> bool {

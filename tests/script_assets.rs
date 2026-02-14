@@ -1,0 +1,561 @@
+mod script_asm;
+
+use bitcoin::{consensus as btc_consensus, hex::FromHex, ScriptBuf, Transaction, TxOut, Witness};
+use consensus::{
+    verify_with_flags_detailed, Utxo, VERIFY_CHECKLOCKTIMEVERIFY, VERIFY_CHECKSEQUENCEVERIFY,
+    VERIFY_DERSIG, VERIFY_NULLDUMMY, VERIFY_P2SH, VERIFY_TAPROOT, VERIFY_WITNESS,
+};
+use serde_json::Value;
+use script_asm::parse_script;
+use std::{
+    collections::BTreeMap,
+    env, fs,
+    path::PathBuf,
+};
+
+const CORE_TX_VALID: &str = include_str!("data/tx_valid.json");
+const CORE_TX_INVALID: &str = include_str!("data/tx_invalid.json");
+
+fn asset_path() -> PathBuf {
+    if let Ok(path) = env::var("SCRIPT_ASSETS_TEST_JSON") {
+        return PathBuf::from(path);
+    }
+    if let Ok(dir) = env::var("DIR_UNIT_TEST_DATA") {
+        return PathBuf::from(dir).join("script_assets_test.json");
+    }
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/data/script_assets_test.json")
+}
+
+fn all_consensus_flags() -> Vec<u32> {
+    let mut flags = Vec::new();
+    for bits in 0u32..128 {
+        let mut value = 0u32;
+        if bits & 1 != 0 {
+            value |= VERIFY_P2SH;
+        }
+        if bits & 2 != 0 {
+            value |= VERIFY_DERSIG;
+        }
+        if bits & 4 != 0 {
+            value |= VERIFY_NULLDUMMY;
+        }
+        if bits & 8 != 0 {
+            value |= VERIFY_CHECKLOCKTIMEVERIFY;
+        }
+        if bits & 16 != 0 {
+            value |= VERIFY_CHECKSEQUENCEVERIFY;
+        }
+        if bits & 32 != 0 {
+            value |= VERIFY_WITNESS;
+        }
+        if bits & 64 != 0 {
+            value |= VERIFY_TAPROOT;
+        }
+        if value & VERIFY_WITNESS != 0 && value & VERIFY_P2SH == 0 {
+            continue;
+        }
+        if value & VERIFY_TAPROOT != 0 && value & VERIFY_WITNESS == 0 {
+            continue;
+        }
+        flags.push(value);
+    }
+    flags
+}
+
+fn parse_flags(raw: &str) -> u32 {
+    let mut bits = 0u32;
+    for token in raw
+        .split(',')
+        .map(str::trim)
+        .filter(|token| !token.is_empty())
+    {
+        bits |= match token {
+            "P2SH" => VERIFY_P2SH,
+            "DERSIG" => VERIFY_DERSIG,
+            "NULLDUMMY" => VERIFY_NULLDUMMY,
+            "CHECKLOCKTIMEVERIFY" => VERIFY_CHECKLOCKTIMEVERIFY,
+            "CHECKSEQUENCEVERIFY" => VERIFY_CHECKSEQUENCEVERIFY,
+            "WITNESS" => VERIFY_WITNESS,
+            "TAPROOT" => VERIFY_TAPROOT,
+            other => panic!("unknown consensus flag in script asset test: {other}"),
+        };
+    }
+    bits
+}
+
+#[derive(Debug)]
+enum TxVectorFlagParse {
+    Parsed(u32),
+    Skip(TxVectorSkipReason),
+}
+
+#[derive(Debug)]
+enum TxVectorSkipReason {
+    BadTx,
+    UnknownToken(String),
+    UnsupportedTokens(Vec<String>),
+    NonCanonicalFlags,
+}
+
+#[derive(Default)]
+struct MonotonicityStats {
+    total_vectors: usize,
+    parsed_vectors: usize,
+    checked_vectors: usize,
+    skipped_badtx: usize,
+    skipped_unknown: usize,
+    skipped_unsupported: usize,
+    skipped_noncanonical: usize,
+    unknown_token_counts: BTreeMap<String, usize>,
+    unsupported_token_counts: BTreeMap<String, usize>,
+}
+
+fn parse_tx_vector_flags(raw: &str) -> TxVectorFlagParse {
+    if raw.trim().is_empty() || raw == "NONE" {
+        return TxVectorFlagParse::Parsed(0);
+    }
+
+    let mut bits = 0u32;
+    let mut unsupported_tokens = Vec::new();
+    for token in raw
+        .split(',')
+        .map(str::trim)
+        .filter(|token| !token.is_empty())
+    {
+        let bit = match token {
+            "P2SH" => VERIFY_P2SH,
+            "DERSIG" => VERIFY_DERSIG,
+            "NULLDUMMY" => VERIFY_NULLDUMMY,
+            "CHECKLOCKTIMEVERIFY" => VERIFY_CHECKLOCKTIMEVERIFY,
+            "CHECKSEQUENCEVERIFY" => VERIFY_CHECKSEQUENCEVERIFY,
+            "WITNESS" => VERIFY_WITNESS,
+            "TAPROOT" => VERIFY_TAPROOT,
+            "BADTX" => return TxVectorFlagParse::Skip(TxVectorSkipReason::BadTx),
+            // Known Core tokens not part of this monotonicity subset.
+            "STRICTENC"
+            | "LOW_S"
+            | "SIGPUSHONLY"
+            | "MINIMALDATA"
+            | "DISCOURAGE_UPGRADABLE_NOPS"
+            | "CLEANSTACK"
+            | "MINIMALIF"
+            | "NULLFAIL"
+            | "CONST_SCRIPTCODE"
+            | "DISCOURAGE_UPGRADABLE_WITNESS_PROGRAM"
+            | "WITNESS_PUBKEYTYPE"
+            | "DISCOURAGE_UPGRADABLE_PUBKEYTYPE"
+            | "DISCOURAGE_OP_SUCCESS"
+            | "DISCOURAGE_UPGRADABLE_TAPROOT_VERSION" => {
+                unsupported_tokens.push(token.to_string());
+                continue;
+            }
+            other => {
+                return TxVectorFlagParse::Skip(TxVectorSkipReason::UnknownToken(
+                    other.to_string(),
+                ));
+            }
+        };
+        bits |= bit;
+    }
+
+    if !unsupported_tokens.is_empty() {
+        return TxVectorFlagParse::Skip(TxVectorSkipReason::UnsupportedTokens(
+            unsupported_tokens,
+        ));
+    }
+
+    if (bits & VERIFY_WITNESS != 0 && bits & VERIFY_P2SH == 0)
+        || (bits & VERIFY_TAPROOT != 0 && bits & VERIFY_WITNESS == 0)
+    {
+        return TxVectorFlagParse::Skip(TxVectorSkipReason::NonCanonicalFlags);
+    }
+    TxVectorFlagParse::Parsed(bits)
+}
+
+fn parse_witness(value: &Value) -> Witness {
+    let entries = value
+        .as_array()
+        .unwrap_or_else(|| panic!("witness field must be an array"));
+    let mut stack_items = Vec::with_capacity(entries.len());
+    for entry in entries {
+        let encoded = entry
+            .as_str()
+            .unwrap_or_else(|| panic!("witness entries must be hex strings"));
+        let bytes = Vec::from_hex(encoded)
+            .unwrap_or_else(|_| panic!("invalid witness hex in script asset test"));
+        stack_items.push(bytes);
+    }
+    Witness::from_slice(&stack_items)
+}
+
+fn parse_prevouts(value: &Value) -> Vec<TxOut> {
+    let entries = value
+        .as_array()
+        .unwrap_or_else(|| panic!("prevouts field must be an array"));
+    let mut prevouts = Vec::with_capacity(entries.len());
+    for entry in entries {
+        let encoded = entry
+            .as_str()
+            .unwrap_or_else(|| panic!("prevout entries must be hex strings"));
+        let bytes = Vec::from_hex(encoded)
+            .unwrap_or_else(|_| panic!("invalid prevout hex in script asset test"));
+        let txout = btc_consensus::deserialize::<TxOut>(&bytes)
+            .unwrap_or_else(|_| panic!("invalid serialized txout in script asset test"));
+        prevouts.push(txout);
+    }
+    prevouts
+}
+
+fn parse_tx_vector_prevouts(value: &Value) -> Vec<TxOut> {
+    let entries = value
+        .as_array()
+        .unwrap_or_else(|| panic!("tx vector prevouts must be an array"));
+    let mut prevouts = Vec::with_capacity(entries.len());
+    for entry in entries {
+        let descriptor = entry
+            .as_array()
+            .unwrap_or_else(|| panic!("tx vector prevout descriptor must be an array"));
+        assert!(
+            (3..=4).contains(&descriptor.len()),
+            "tx vector prevout descriptor must have 3 or 4 fields"
+        );
+        let script_pubkey = parse_script(
+            descriptor[2]
+                .as_str()
+                .unwrap_or_else(|| panic!("tx vector prevout script must be string")),
+        )
+        .unwrap_or_else(|err| panic!("tx vector prevout script asm parse failed: {err}"));
+        let amount_sat = descriptor.get(3).and_then(Value::as_i64).unwrap_or(0);
+        assert!(
+            amount_sat >= 0,
+            "tx vector prevout amounts must be non-negative"
+        );
+        prevouts.push(TxOut {
+            value: bitcoin::Amount::from_sat(amount_sat as u64),
+            script_pubkey,
+        });
+    }
+    prevouts
+}
+
+fn verify_case(
+    tx: &Transaction,
+    prevouts: &[TxOut],
+    input_index: usize,
+    flags: u32,
+) -> Result<(), consensus::ScriptFailure> {
+    let tx_bytes = btc_consensus::serialize(tx);
+    let spent_script = prevouts[input_index].script_pubkey.as_bytes();
+    let amount = prevouts[input_index].value.to_sat();
+
+    if flags & VERIFY_TAPROOT == 0 {
+        return verify_with_flags_detailed(
+            spent_script,
+            amount,
+            &tx_bytes,
+            None,
+            input_index,
+            flags,
+        );
+    }
+
+    let script_storage: Vec<Vec<u8>> = prevouts
+        .iter()
+        .map(|txout| txout.script_pubkey.as_bytes().to_vec())
+        .collect();
+    let utxos: Vec<Utxo> = prevouts
+        .iter()
+        .zip(script_storage.iter())
+        .map(|(txout, script)| Utxo {
+            script_pubkey: script.as_ptr(),
+            script_pubkey_len: script.len() as u32,
+            value: txout.value.to_sat() as i64,
+        })
+        .collect();
+
+    verify_with_flags_detailed(
+        spent_script,
+        amount,
+        &tx_bytes,
+        Some(&utxos),
+        input_index,
+        flags,
+    )
+}
+
+fn run_core_tx_monotonicity(vectors: &str, expect_success: bool) {
+    let cases: Vec<Value> = serde_json::from_str(vectors).expect("core tx vectors parse");
+    let consensus_flags = all_consensus_flags();
+    let mut checked = 0usize;
+    let mut stats = MonotonicityStats::default();
+
+    for case in cases {
+        let arr = match case.as_array() {
+            Some(arr) => arr,
+            None => continue,
+        };
+        if arr.len() == 1 && arr[0].is_string() {
+            continue;
+        }
+        if arr.len() != 3 || !arr[0].is_array() || !arr[1].is_string() || !arr[2].is_string() {
+            continue;
+        }
+        stats.total_vectors += 1;
+
+        let flags_str = arr[2].as_str().expect("flags string");
+        let test_flags = match parse_tx_vector_flags(flags_str) {
+            TxVectorFlagParse::Parsed(flags) => {
+                stats.parsed_vectors += 1;
+                flags
+            }
+            TxVectorFlagParse::Skip(TxVectorSkipReason::BadTx) => {
+                stats.skipped_badtx += 1;
+                continue;
+            }
+            TxVectorFlagParse::Skip(TxVectorSkipReason::UnknownToken(token)) => {
+                stats.skipped_unknown += 1;
+                *stats.unknown_token_counts.entry(token).or_insert(0) += 1;
+                continue;
+            }
+            TxVectorFlagParse::Skip(TxVectorSkipReason::UnsupportedTokens(tokens)) => {
+                stats.skipped_unsupported += 1;
+                for token in tokens {
+                    *stats.unsupported_token_counts.entry(token).or_insert(0) += 1;
+                }
+                continue;
+            }
+            TxVectorFlagParse::Skip(TxVectorSkipReason::NonCanonicalFlags) => {
+                stats.skipped_noncanonical += 1;
+                continue;
+            }
+        };
+        let prevouts = parse_tx_vector_prevouts(&arr[0]);
+        let tx_hex = arr[1].as_str().expect("serialized tx string");
+        let tx: Transaction = btc_consensus::deserialize(
+            &Vec::from_hex(tx_hex).expect("core tx vector serialized transaction hex"),
+        )
+        .expect("core tx vector serialized transaction decode");
+
+        if tx.input.len() != prevouts.len() {
+            continue;
+        }
+
+        for flags in &consensus_flags {
+            if expect_success {
+                if (flags & test_flags) != *flags {
+                    continue;
+                }
+                for input_index in 0..tx.input.len() {
+                    let result = verify_case(&tx, &prevouts, input_index, *flags);
+                    assert!(
+                        result.is_ok(),
+                        "core tx-valid monotonicity mismatch: input={input_index} test_flags={test_flags:#x} flags={flags:#x} tx={tx_hex} result={result:?}"
+                    );
+                }
+                checked += 1;
+                stats.checked_vectors += 1;
+            } else {
+                // `tx_invalid.json` does not guarantee monotonic supersets, so this
+                // large-corpus check validates exact-flag failure only.
+                if *flags != test_flags {
+                    continue;
+                }
+                let mut any_failed = false;
+                for input_index in 0..tx.input.len() {
+                    let result = verify_case(&tx, &prevouts, input_index, *flags);
+                    if result.is_err() {
+                        any_failed = true;
+                        break;
+                    }
+                }
+                assert!(
+                    any_failed,
+                    "core tx-invalid monotonicity mismatch: test_flags={test_flags:#x} flags={flags:#x} tx={tx_hex}"
+                );
+                checked += 1;
+                stats.checked_vectors += 1;
+            }
+        }
+    }
+
+    assert!(checked > 0, "core tx monotonicity checks must execute cases");
+    assert!(
+        stats.unknown_token_counts.is_empty(),
+        "unknown tx-vector flag tokens in monotonicity harness: {:?}",
+        stats.unknown_token_counts
+    );
+    println!(
+        "script_assets coverage (expect_success={}): total={} parsed={} checked={} skipped_badtx={} skipped_unsupported={} skipped_noncanonical={} unsupported_breakdown={:?}",
+        expect_success,
+        stats.total_vectors,
+        stats.parsed_vectors,
+        stats.checked_vectors,
+        stats.skipped_badtx,
+        stats.skipped_unsupported,
+        stats.skipped_noncanonical,
+        stats.unsupported_token_counts
+    );
+}
+
+#[test]
+fn parse_tx_vector_flags_accepts_none_and_known_tokens() {
+    assert!(matches!(
+        parse_tx_vector_flags("NONE"),
+        TxVectorFlagParse::Parsed(0)
+    ));
+    assert!(matches!(
+        parse_tx_vector_flags("P2SH,WITNESS"),
+        TxVectorFlagParse::Parsed(flags) if flags == (VERIFY_P2SH | VERIFY_WITNESS)
+    ));
+}
+
+#[test]
+fn parse_tx_vector_flags_rejects_unknown_and_unsupported_tokens() {
+    assert!(matches!(
+        parse_tx_vector_flags("P2SH,NO_SUCH_FLAG"),
+        TxVectorFlagParse::Skip(TxVectorSkipReason::UnknownToken(_))
+    ));
+    assert!(matches!(
+        parse_tx_vector_flags("P2SH,STRICTENC"),
+        TxVectorFlagParse::Skip(TxVectorSkipReason::UnsupportedTokens(_))
+    ));
+}
+
+#[test]
+fn script_assets_flag_monotonicity() {
+    let path = asset_path();
+    assert!(
+        path.exists(),
+        "script assets file does not exist: {}",
+        path.display()
+    );
+
+    let raw = fs::read_to_string(&path).unwrap_or_else(|err| {
+        panic!(
+            "failed to read script assets file {}: {err}",
+            path.display()
+        )
+    });
+    let tests: Value = serde_json::from_str(&raw).unwrap_or_else(|err| {
+        panic!(
+            "failed to parse script assets JSON {}: {err}",
+            path.display()
+        )
+    });
+    let entries = tests
+        .as_array()
+        .unwrap_or_else(|| panic!("script assets top-level JSON must be an array"));
+    assert!(!entries.is_empty(), "script assets JSON is empty");
+
+    let consensus_flags = all_consensus_flags();
+    for (idx, case) in entries.iter().enumerate() {
+        let obj = case
+            .as_object()
+            .unwrap_or_else(|| panic!("script asset case #{idx} must be an object"));
+        let base_tx_hex = obj
+            .get("tx")
+            .and_then(Value::as_str)
+            .unwrap_or_else(|| panic!("script asset case #{idx} missing tx"));
+        let tx_bytes = Vec::from_hex(base_tx_hex)
+            .unwrap_or_else(|_| panic!("script asset case #{idx} has invalid tx hex"));
+        let mut tx = btc_consensus::deserialize::<Transaction>(&tx_bytes)
+            .unwrap_or_else(|_| panic!("script asset case #{idx} tx failed to deserialize"));
+        let prevouts = parse_prevouts(
+            obj.get("prevouts")
+                .unwrap_or_else(|| panic!("script asset case #{idx} missing prevouts")),
+        );
+        let input_index = obj
+            .get("index")
+            .and_then(Value::as_u64)
+            .unwrap_or_else(|| panic!("script asset case #{idx} missing index"))
+            as usize;
+        assert_eq!(
+            prevouts.len(),
+            tx.input.len(),
+            "script asset case #{idx} prevout count mismatch"
+        );
+        assert!(
+            input_index < tx.input.len(),
+            "script asset case #{idx} input index out of range"
+        );
+
+        let test_flags = parse_flags(
+            obj.get("flags")
+                .and_then(Value::as_str)
+                .unwrap_or_else(|| panic!("script asset case #{idx} missing flags")),
+        );
+        let final_case = obj.get("final").and_then(Value::as_bool).unwrap_or(false);
+
+        if let Some(success) = obj.get("success") {
+            let success_obj = success
+                .as_object()
+                .unwrap_or_else(|| panic!("script asset case #{idx} success must be object"));
+            let script_sig_hex = success_obj
+                .get("scriptSig")
+                .and_then(Value::as_str)
+                .unwrap_or_else(|| panic!("script asset case #{idx} success missing scriptSig"));
+            let script_sig =
+                ScriptBuf::from_bytes(Vec::from_hex(script_sig_hex).unwrap_or_else(|_| {
+                    panic!("script asset case #{idx} has invalid success scriptSig")
+                }));
+            let witness = parse_witness(
+                success_obj
+                    .get("witness")
+                    .unwrap_or_else(|| panic!("script asset case #{idx} success missing witness")),
+            );
+            tx.input[input_index].script_sig = script_sig;
+            tx.input[input_index].witness = witness;
+
+            for flags in &consensus_flags {
+                if final_case || ((flags & test_flags) == *flags) {
+                    let result = verify_case(&tx, &prevouts, input_index, *flags);
+                    assert!(
+                        result.is_ok(),
+                        "script asset case #{idx} expected success for flags {flags:#x}, got {result:?}"
+                    );
+                }
+            }
+        }
+
+        if let Some(failure) = obj.get("failure") {
+            let failure_obj = failure
+                .as_object()
+                .unwrap_or_else(|| panic!("script asset case #{idx} failure must be object"));
+            let script_sig_hex = failure_obj
+                .get("scriptSig")
+                .and_then(Value::as_str)
+                .unwrap_or_else(|| panic!("script asset case #{idx} failure missing scriptSig"));
+            let script_sig =
+                ScriptBuf::from_bytes(Vec::from_hex(script_sig_hex).unwrap_or_else(|_| {
+                    panic!("script asset case #{idx} has invalid failure scriptSig")
+                }));
+            let witness = parse_witness(
+                failure_obj
+                    .get("witness")
+                    .unwrap_or_else(|| panic!("script asset case #{idx} failure missing witness")),
+            );
+            tx.input[input_index].script_sig = script_sig;
+            tx.input[input_index].witness = witness;
+
+            for flags in &consensus_flags {
+                if (flags & test_flags) == test_flags {
+                    let result = verify_case(&tx, &prevouts, input_index, *flags);
+                    assert!(
+                        result.is_err(),
+                        "script asset case #{idx} expected failure for flags {flags:#x}"
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn script_assets_monotonicity_over_core_tx_valid_vectors() {
+    run_core_tx_monotonicity(CORE_TX_VALID, true);
+}
+
+#[test]
+fn script_assets_core_tx_invalid_exact_flag_failures() {
+    run_core_tx_monotonicity(CORE_TX_INVALID, false);
+}

@@ -15,16 +15,16 @@ use bitcoin::{
     blockdata::transaction::Sequence,
     consensus::Encodable,
     hashes::{hash160, ripemd160, sha1, sha256, sha256d, Hash, HashEngine},
-    key::{TapTweak, UntweakedPublicKey},
+    key::UntweakedPublicKey,
     opcodes::{all, Opcode},
     script::Builder,
     secp256k1::{
         self, ecdsa::Signature as EcdsaSignature, schnorr::Signature as SchnorrSignature, Message,
         Parity, PublicKey, Secp256k1, XOnlyPublicKey,
     },
-    sighash::{Annex, EcdsaSighashType, Prevouts, SegwitV0Sighash, SighashCache, TapSighashType},
+    sighash::{Annex, Prevouts, SegwitV0Sighash, SighashCache, TapSighashType},
     taproot::{
-        TapLeafHash, TapNodeHash, TAPROOT_ANNEX_PREFIX, TAPROOT_CONTROL_BASE_SIZE,
+        TapLeafHash, TapNodeHash, TapTweakHash, TAPROOT_ANNEX_PREFIX, TAPROOT_CONTROL_BASE_SIZE,
         TAPROOT_CONTROL_MAX_SIZE, TAPROOT_CONTROL_NODE_SIZE, TAPROOT_LEAF_MASK,
         TAPROOT_LEAF_TAPSCRIPT,
     },
@@ -34,11 +34,12 @@ use bitcoin::{
 use crate::{
     tx::{PrecomputedTransactionData, SpentOutputs, TransactionContext},
     Error, VERIFY_CHECKLOCKTIMEVERIFY, VERIFY_CHECKSEQUENCEVERIFY, VERIFY_CLEANSTACK,
-    VERIFY_DERSIG, VERIFY_DISCOURAGE_OP_SUCCESS, VERIFY_DISCOURAGE_UPGRADABLE_NOPS,
-    VERIFY_DISCOURAGE_UPGRADABLE_PUBKEYTYPE, VERIFY_DISCOURAGE_UPGRADABLE_TAPROOT_VERSION,
-    VERIFY_DISCOURAGE_UPGRADABLE_WITNESS_PROGRAM, VERIFY_LOW_S, VERIFY_MINIMALDATA,
-    VERIFY_MINIMALIF, VERIFY_NULLDUMMY, VERIFY_NULLFAIL, VERIFY_P2SH, VERIFY_SIGPUSHONLY,
-    VERIFY_STRICTENC, VERIFY_TAPROOT, VERIFY_WITNESS, VERIFY_WITNESS_PUBKEYTYPE,
+    VERIFY_CONST_SCRIPTCODE, VERIFY_DERSIG, VERIFY_DISCOURAGE_OP_SUCCESS,
+    VERIFY_DISCOURAGE_UPGRADABLE_NOPS, VERIFY_DISCOURAGE_UPGRADABLE_PUBKEYTYPE,
+    VERIFY_DISCOURAGE_UPGRADABLE_TAPROOT_VERSION, VERIFY_DISCOURAGE_UPGRADABLE_WITNESS_PROGRAM,
+    VERIFY_LOW_S, VERIFY_MINIMALDATA, VERIFY_MINIMALIF, VERIFY_NULLDUMMY, VERIFY_NULLFAIL,
+    VERIFY_P2SH, VERIFY_SIGPUSHONLY, VERIFY_STRICTENC, VERIFY_TAPROOT, VERIFY_WITNESS,
+    VERIFY_WITNESS_PUBKEYTYPE,
 };
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
@@ -59,6 +60,7 @@ pub enum ScriptError {
     CheckMultiSigVerify,
     NumEqualVerify,
     BadOpcode,
+    OpCodeSeparator,
     DisabledOpcode,
     InvalidStackOperation,
     InvalidAltstackOperation,
@@ -116,7 +118,8 @@ const SUPPORTED_FLAGS: u32 = VERIFY_P2SH
     | VERIFY_CLEANSTACK
     | VERIFY_MINIMALIF
     | VERIFY_NULLFAIL
-    | VERIFY_WITNESS_PUBKEYTYPE;
+    | VERIFY_WITNESS_PUBKEYTYPE
+    | VERIFY_CONST_SCRIPTCODE;
 
 const MAX_STACK_SIZE: usize = 1000;
 const MAX_SCRIPT_SIZE: usize = 10_000;
@@ -128,7 +131,6 @@ const MAX_PUBKEYS_PER_MULTISIG: usize = 20;
 const SEQUENCE_LOCKTIME_DISABLE_FLAG: u32 = 1 << 31;
 const SEQUENCE_LOCKTIME_TYPE_FLAG: u32 = 1 << 22;
 const SEQUENCE_LOCKTIME_MASK: u32 = 0x0000ffff;
-const SEQUENCE_LOCKTIME_GRANULARITY: u32 = 9;
 const VALIDATION_WEIGHT_PER_SIGOP_PASSED: i64 = 50;
 const VALIDATION_WEIGHT_OFFSET: i64 = 50;
 
@@ -168,7 +170,7 @@ impl ScriptFlags {
         if bits & !SUPPORTED_FLAGS != 0 {
             return Err(Error::ERR_INVALID_FLAGS);
         }
-        Ok(Self(Self::apply_implied_bits(bits)))
+        Ok(Self(bits))
     }
 
     pub fn bits(self) -> u32 {
@@ -177,16 +179,6 @@ impl ScriptFlags {
 
     pub fn requires_spent_outputs(self) -> bool {
         self.0 & VERIFY_TAPROOT != 0
-    }
-
-    fn apply_implied_bits(mut bits: u32) -> u32 {
-        if bits & VERIFY_TAPROOT != 0 {
-            bits |= VERIFY_WITNESS;
-        }
-        if bits & VERIFY_WITNESS != 0 {
-            bits |= VERIFY_P2SH;
-        }
-        bits
     }
 }
 
@@ -247,27 +239,36 @@ impl<'a> ControlBlock<'a> {
 struct ScriptCodeCache {
     identity: ScriptIdentity,
     code_separator: usize,
+    strip_codeseparators: bool,
     script: ScriptBuf,
 }
 
 #[derive(Copy, Clone, Default, PartialEq, Eq)]
 struct ScriptIdentity {
-    ptr: *const u8,
+    digest: [u8; 32],
     len: usize,
 }
 
 impl ScriptIdentity {
     fn new(script: &Script) -> Self {
+        let digest = sha256::Hash::hash(script.as_bytes()).to_byte_array();
         Self {
-            ptr: script.as_bytes().as_ptr(),
+            digest,
             len: script.as_bytes().len(),
         }
     }
 }
 
 impl ScriptCodeCache {
-    fn matches(&self, identity: ScriptIdentity, code_separator: usize) -> bool {
-        self.identity == identity && self.code_separator == code_separator
+    fn matches(
+        &self,
+        identity: ScriptIdentity,
+        code_separator: usize,
+        strip_codeseparators: bool,
+    ) -> bool {
+        self.identity == identity
+            && self.code_separator == code_separator
+            && self.strip_codeseparators == strip_codeseparators
     }
 }
 
@@ -389,7 +390,7 @@ pub struct Interpreter<'tx, 'script> {
     spent_output_script: &'script [u8],
     spent_outputs: Option<SpentOutputs>,
     tx_ctx: &'tx TransactionContext,
-    _precomputed: PrecomputedTransactionData,
+    precomputed: Option<PrecomputedTransactionData>,
     input_index: usize,
     script_code_cache: Option<ScriptCodeCache>,
     sighash_cache: RefCell<SighashCache<&'tx Transaction>>,
@@ -405,7 +406,6 @@ pub struct Interpreter<'tx, 'script> {
 impl<'tx, 'script> Interpreter<'tx, 'script> {
     pub fn new(
         tx_ctx: &'tx TransactionContext,
-        precomputed: PrecomputedTransactionData,
         input_index: usize,
         spend: SpendContext<'script>,
         flags: ScriptFlags,
@@ -428,7 +428,7 @@ impl<'tx, 'script> Interpreter<'tx, 'script> {
             spent_output_script: script_pubkey,
             spent_outputs,
             tx_ctx,
-            _precomputed: precomputed,
+            precomputed: None,
             input_index,
             script_code_cache: None,
             sighash_cache: RefCell::new(SighashCache::new(tx_ctx.tx())),
@@ -450,6 +450,7 @@ impl<'tx, 'script> Interpreter<'tx, 'script> {
         self.last_error = ScriptError::Ok;
         self.had_witness = false;
         self.exec_data = ExecutionData::default();
+        self.script_code_cache = None;
         let txin = &self.tx_ctx.tx().input[self.input_index];
         self.initialize_sigops(txin.script_sig.as_bytes())?;
         let witness_enabled = self.flags.bits() & VERIFY_WITNESS != 0;
@@ -536,16 +537,15 @@ impl<'tx, 'script> Interpreter<'tx, 'script> {
             return Err(self.fail(ScriptError::EvalFalse));
         }
 
+        if self.flags.bits() & VERIFY_CLEANSTACK != 0 {
+            self.require_clean_stack(&self.stack).map_err(|err| self.fail(err))?;
+        }
+
         if witness_enabled && !self.had_witness && !txin.witness.is_empty() {
             return Err(self.fail(ScriptError::WitnessUnexpected));
         }
 
-        if self.flags.bits() & VERIFY_CLEANSTACK != 0 {
-            self.require_clean_stack(&self.stack)
-                .map_err(|err| self.fail(err))
-        } else {
-            Ok(())
-        }
+        Ok(())
     }
 
     #[inline]
@@ -627,15 +627,15 @@ impl<'tx, 'script> Interpreter<'tx, 'script> {
 
         self.exec_stack.clear();
         self.op_count = 0;
-        let script = ScriptBuf::from_bytes(script_bytes.to_vec());
+        let script = Script::from_bytes(script_bytes);
         let bytes = script.as_bytes();
         let mut altstack: Vec<Vec<u8>> = Vec::new();
         let mut code_separator = 0usize;
         let mut cursor = 0usize;
+        let mut opcode_pos: u32 = 0;
         let script_len = bytes.len();
 
         while cursor < script_len {
-            let position = cursor;
             let opcode = bytes[cursor];
             cursor += 1;
             let should_execute = self.exec_stack.iter().all(|&cond| cond);
@@ -715,6 +715,12 @@ impl<'tx, 'script> Interpreter<'tx, 'script> {
                 if sigversion != SigVersion::Taproot && opcode > all::OP_PUSHNUM_16.to_u8() {
                     self.add_ops(1)?;
                 }
+                if op == all::OP_CODESEPARATOR
+                    && sigversion == SigVersion::Base
+                    && self.flags.bits() & VERIFY_CONST_SCRIPTCODE != 0
+                {
+                    return Err(self.fail(ScriptError::OpCodeSeparator));
+                }
 
                 if is_control_flow(op) {
                     let control_res =
@@ -724,14 +730,14 @@ impl<'tx, 'script> Interpreter<'tx, 'script> {
                     if op == all::OP_CODESEPARATOR {
                         code_separator = cursor;
                         if sigversion == SigVersion::Taproot {
-                            self.exec_data.code_separator_pos = Some(position as u32);
+                            self.exec_data.code_separator_pos = Some(opcode_pos);
                         }
                     } else {
                         let opcode_res = self.execute_opcode(
                             stack,
                             &mut altstack,
                             op,
-                            &script,
+                            script,
                             code_separator,
                             sigversion,
                         );
@@ -742,6 +748,7 @@ impl<'tx, 'script> Interpreter<'tx, 'script> {
 
             let limit_res = self.ensure_stack_limit(stack.len(), altstack.len());
             self.track_script_error(limit_res)?;
+            opcode_pos = opcode_pos.wrapping_add(1);
         }
 
         if !self.exec_stack.is_empty() {
@@ -1289,10 +1296,19 @@ impl<'tx, 'script> Interpreter<'tx, 'script> {
         let result = match sigversion {
             SigVersion::Taproot => self.verify_tapscript_signature(&sig, &pubkey)?,
             _ => {
+                let mut script_code = self.build_script_code(script, code_separator, sigversion)?;
+                if sigversion == SigVersion::Base {
+                    script_code =
+                        self.apply_legacy_find_and_delete(script_code.as_script(), &[&sig])?;
+                }
                 let sig_parts = self.parse_signature(&sig, sigversion)?;
                 self.check_pubkey_encoding(&pubkey, sigversion)?;
-                let script_code = self.build_script_code(script, code_separator)?;
-                self.verify_ecdsa_signature(sig_parts, &pubkey, &script_code, sigversion, &sig)?
+                self.verify_ecdsa_signature(
+                    sig_parts,
+                    &pubkey,
+                    script_code.as_script(),
+                    sigversion,
+                )?
             }
         };
         if sigversion != SigVersion::Taproot
@@ -1347,7 +1363,12 @@ impl<'tx, 'script> Interpreter<'tx, 'script> {
             sigs.push(sig);
         }
 
-        let script_code = self.build_script_code(script, code_separator)?;
+        let mut script_code = self.build_script_code(script, code_separator, sigversion)?;
+        if sigversion == SigVersion::Base {
+            let signatures = sigs.iter().map(Vec::as_slice).collect::<Vec<_>>();
+            script_code =
+                self.apply_legacy_find_and_delete(script_code.as_script(), &signatures)?;
+        }
         let dummy = self.map_failure(stack.pop_bytes(), ScriptError::InvalidStackOperation)?;
         if self.flags.bits() & VERIFY_NULLDUMMY != 0 && !dummy.is_empty() {
             return Err(self.fail(ScriptError::SigNullDummy));
@@ -1364,14 +1385,13 @@ impl<'tx, 'script> Interpreter<'tx, 'script> {
                 break;
             }
 
-            self.check_pubkey_encoding(&pubkeys[key_index], sigversion)?;
             let sig_parts = self.parse_signature(&sigs[sig_index], sigversion)?;
+            self.check_pubkey_encoding(&pubkeys[key_index], sigversion)?;
             let sig_valid = self.verify_ecdsa_signature(
                 sig_parts,
                 &pubkeys[key_index],
-                &script_code,
+                script_code.as_script(),
                 sigversion,
-                &sigs[sig_index],
             )?;
             if !sig_valid && enforce_nullfail && !sigs[sig_index].is_empty() {
                 return Err(self.fail(ScriptError::NullFail));
@@ -1475,12 +1495,11 @@ impl<'tx, 'script> Interpreter<'tx, 'script> {
     }
 
     fn check_sequence(&self, sequence: u64) -> Result<(), ScriptError> {
-        if sequence > u32::MAX as u64 {
-            return Err(ScriptError::UnsatisfiedLockTime);
-        }
-        let sequence_u32 = sequence as u32;
-        if sequence_u32 & SEQUENCE_LOCKTIME_DISABLE_FLAG != 0 {
+        if (sequence as u32) & SEQUENCE_LOCKTIME_DISABLE_FLAG != 0 {
             return Ok(());
+        }
+        if self.tx_ctx.tx().version.0 < 2 {
+            return Err(ScriptError::UnsatisfiedLockTime);
         }
 
         let tx_sequence = self.tx_ctx.tx().input[self.input_index]
@@ -1490,24 +1509,16 @@ impl<'tx, 'script> Interpreter<'tx, 'script> {
             return Err(ScriptError::UnsatisfiedLockTime);
         }
 
-        let tx_type = tx_sequence & SEQUENCE_LOCKTIME_TYPE_FLAG;
-        let seq_type = sequence_u32 & SEQUENCE_LOCKTIME_TYPE_FLAG;
-        if tx_type != seq_type {
+        let locktime_mask = SEQUENCE_LOCKTIME_TYPE_FLAG | SEQUENCE_LOCKTIME_MASK;
+        let tx_sequence_masked = tx_sequence & locktime_mask;
+        let sequence_masked = (sequence as u32) & locktime_mask;
+        let tx_is_time = tx_sequence_masked >= SEQUENCE_LOCKTIME_TYPE_FLAG;
+        let sequence_is_time = sequence_masked >= SEQUENCE_LOCKTIME_TYPE_FLAG;
+        if tx_is_time != sequence_is_time {
             return Err(ScriptError::UnsatisfiedLockTime);
         }
 
-        let tx_value = if tx_type != 0 {
-            (tx_sequence & SEQUENCE_LOCKTIME_MASK) << SEQUENCE_LOCKTIME_GRANULARITY
-        } else {
-            tx_sequence & SEQUENCE_LOCKTIME_MASK
-        };
-        let seq_value = if seq_type != 0 {
-            (sequence_u32 & SEQUENCE_LOCKTIME_MASK) << SEQUENCE_LOCKTIME_GRANULARITY
-        } else {
-            sequence_u32 & SEQUENCE_LOCKTIME_MASK
-        };
-
-        if tx_value < seq_value {
+        if sequence_masked > tx_sequence_masked {
             return Err(ScriptError::UnsatisfiedLockTime);
         }
 
@@ -1636,18 +1647,22 @@ impl<'tx, 'script> Interpreter<'tx, 'script> {
         &mut self,
         script: &Script,
         code_separator: usize,
+        sigversion: SigVersion,
     ) -> Result<ScriptBuf, Error> {
+        let strip_codeseparators = matches!(sigversion, SigVersion::Base);
         let identity = ScriptIdentity::new(script);
         let needs_refresh = self
             .script_code_cache
             .as_ref()
-            .map(|cache| !cache.matches(identity, code_separator))
+            .map(|cache| !cache.matches(identity, code_separator, strip_codeseparators))
             .unwrap_or(true);
         if needs_refresh {
-            let script_buf = Self::materialize_script_code(script, code_separator)?;
+            let script_buf =
+                Self::materialize_script_code(script, code_separator, strip_codeseparators)?;
             self.script_code_cache = Some(ScriptCodeCache {
                 identity,
                 code_separator,
+                strip_codeseparators,
                 script: script_buf,
             });
         }
@@ -1659,13 +1674,21 @@ impl<'tx, 'script> Interpreter<'tx, 'script> {
             .clone())
     }
 
-    fn materialize_script_code(script: &Script, code_separator: usize) -> Result<ScriptBuf, Error> {
+    fn materialize_script_code(
+        script: &Script,
+        code_separator: usize,
+        strip_codeseparators: bool,
+    ) -> Result<ScriptBuf, Error> {
         if code_separator > script.as_bytes().len() {
             return Err(Error::ERR_SCRIPT);
         }
         let tail = &script.as_bytes()[code_separator..];
-        let stripped = strip_opcode(tail, all::OP_CODESEPARATOR)?;
-        Ok(ScriptBuf::from_bytes(stripped))
+        if strip_codeseparators {
+            let stripped = strip_opcode(tail, all::OP_CODESEPARATOR)?;
+            Ok(ScriptBuf::from_bytes(stripped))
+        } else {
+            Ok(ScriptBuf::from_bytes(tail.to_vec()))
+        }
     }
 
     fn execute_witness_program(
@@ -1738,8 +1761,7 @@ impl<'tx, 'script> Interpreter<'tx, 'script> {
         }
 
         if stack_len == 1 {
-            let signature = witness[0].to_vec();
-            return self.verify_taproot_key_path(program, signature);
+            return self.verify_taproot_key_path(program, witness[0].as_ref());
         }
 
         let control_slice = witness[stack_len - 1].as_ref();
@@ -1840,24 +1862,21 @@ impl<'tx, 'script> Interpreter<'tx, 'script> {
             .map_err(|_| self.fail(ScriptError::WitnessProgramMismatch))?;
         let output_key = XOnlyPublicKey::from_slice(program)
             .map_err(|_| self.fail(ScriptError::WitnessProgramMismatch))?;
-        let parity_bit = control[0] & 1;
+        let expected_parity = if control[0] & 1 == 0 {
+            Parity::Even
+        } else {
+            Parity::Odd
+        };
+        let tweak = TapTweakHash::from_key_and_tweak(internal_key, Some(merkle_root)).to_scalar();
         with_secp256k1_verification_ctx(|secp| {
-            let (expected_key, expected_parity) = internal_key.tap_tweak(secp, Some(merkle_root));
-            let expected_parity_bit = match expected_parity {
-                Parity::Even => 0u8,
-                Parity::Odd => 1u8,
-            };
-            if parity_bit != expected_parity_bit {
-                return Err(self.fail(ScriptError::WitnessProgramMismatch));
-            }
-            if expected_key.to_x_only_public_key() != output_key {
+            if !internal_key.tweak_add_check(secp, &output_key, expected_parity, tweak) {
                 return Err(self.fail(ScriptError::WitnessProgramMismatch));
             }
             Ok(())
         })
     }
 
-    fn verify_taproot_key_path(&mut self, program: &[u8], signature: Vec<u8>) -> Result<(), Error> {
+    fn verify_taproot_key_path(&mut self, program: &[u8], signature: &[u8]) -> Result<(), Error> {
         if program.len() != 32 {
             return Err(self.fail(ScriptError::WitnessProgramMismatch));
         }
@@ -1867,7 +1886,7 @@ impl<'tx, 'script> Interpreter<'tx, 'script> {
 
         let pubkey = XOnlyPublicKey::from_slice(program)
             .map_err(|_| self.fail(ScriptError::WitnessProgramMismatch))?;
-        let Some(parts) = self.parse_taproot_signature(&signature)? else {
+        let Some(parts) = self.parse_taproot_signature(signature)? else {
             return Err(self.fail(ScriptError::SchnorrSigSize));
         };
         let is_valid = self.verify_taproot_signature_common(
@@ -1888,15 +1907,14 @@ impl<'tx, 'script> Interpreter<'tx, 'script> {
             return Err(self.fail(ScriptError::WitnessProgramWitnessEmpty));
         }
 
-        let witness_script_bytes = witness[witness.len() - 1].to_vec();
-        let witness_script = ScriptBuf::from_bytes(witness_script_bytes.clone());
-        let script_hash = sha256::Hash::hash(&witness_script_bytes);
+        let witness_script_bytes = witness[witness.len() - 1].as_ref();
+        let script_hash = sha256::Hash::hash(witness_script_bytes);
         let hash_bytes: &[u8] = script_hash.as_ref();
         if hash_bytes != program {
             return Err(self.fail(ScriptError::WitnessProgramMismatch));
         }
 
-        self.add_sigops_from_script(&witness_script_bytes, true)?;
+        self.add_sigops_from_script(witness_script_bytes, true)?;
         let items = witness
             .iter()
             .take(witness.len() - 1)
@@ -1904,7 +1922,7 @@ impl<'tx, 'script> Interpreter<'tx, 'script> {
             .collect();
         let mut stack = ScriptStack::from_items(items).map_err(|err| self.fail(err))?;
 
-        self.run_script(&mut stack, witness_script.as_bytes(), SigVersion::WitnessV0)?;
+        self.run_script(&mut stack, witness_script_bytes, SigVersion::WitnessV0)?;
         self.ensure_witness_success(&stack)
     }
 
@@ -1980,6 +1998,11 @@ impl<'tx, 'script> Interpreter<'tx, 'script> {
         pubkey: &XOnlyPublicKey,
         leaf_hash: Option<(TapLeafHash, u32)>,
     ) -> Result<bool, Error> {
+        let taproot_ready = self.ensure_precomputed().bip341_taproot_ready;
+        if !taproot_ready {
+            return Err(self.fail(ScriptError::SchnorrSigHashType));
+        }
+
         let spent_outputs = self
             .spent_outputs
             .as_ref()
@@ -2006,13 +2029,17 @@ impl<'tx, 'script> Interpreter<'tx, 'script> {
     }
 
     fn verify_ecdsa_signature(
-        &self,
+        &mut self,
         sig_parts: Option<SignatureParts>,
         pubkey_bytes: &[u8],
         script_code: &Script,
         sigversion: SigVersion,
-        raw_signature: &[u8],
     ) -> Result<bool, Error> {
+        let pubkey = match PublicKey::from_slice(pubkey_bytes) {
+            Ok(pk) => pk,
+            Err(_) => return Ok(false),
+        };
+
         let Some(SignatureParts {
             signature,
             sighash_type,
@@ -2020,49 +2047,21 @@ impl<'tx, 'script> Interpreter<'tx, 'script> {
         else {
             return Ok(false);
         };
-
-        let pubkey = match PublicKey::from_slice(pubkey_bytes) {
-            Ok(pk) => pk,
-            Err(_) => return Ok(false),
-        };
-
         let mut normalized_sig = signature;
         normalized_sig.normalize_s();
 
         let raw_sighash_type = sighash_type;
-        let sighash_type = EcdsaSighashType::from_consensus(raw_sighash_type);
-
-        let mut script_bytes = script_code.as_bytes().to_vec();
-        if sigversion == SigVersion::Base {
-            let sig_push = single_push_script(raw_signature).map_err(|_| Error::ERR_SCRIPT)?;
-            let (filtered, _) = find_and_delete(&script_bytes, sig_push.as_bytes());
-            script_bytes = filtered;
-        }
-        let script_buf = ScriptBuf::from_bytes(script_bytes);
         let message = match sigversion {
             SigVersion::Base => {
                 let sighash = self
                     .sighash_cache
                     .borrow()
-                    .legacy_signature_hash(self.input_index, &script_buf, raw_sighash_type)
+                    .legacy_signature_hash(self.input_index, script_code, raw_sighash_type)
                     .map_err(|_| Error::ERR_SCRIPT)?;
                 <Message as From<_>>::from(sighash)
             }
             SigVersion::WitnessV0 => {
-                let mut engine = SegwitV0Sighash::engine();
-                {
-                    let mut cache = self.sighash_cache.borrow_mut();
-                    cache
-                        .segwit_v0_encode_signing_data_to(
-                            &mut engine,
-                            self.input_index,
-                            &script_buf,
-                            Amount::from_sat(self.amount),
-                            sighash_type,
-                        )
-                        .map_err(|_| Error::ERR_SCRIPT)?;
-                }
-                let sighash = SegwitV0Sighash::from_engine(engine);
+                let sighash = self.segwit_v0_signature_hash(script_code, raw_sighash_type)?;
                 <Message as From<_>>::from(sighash)
             }
             SigVersion::Taproot => return Err(Error::ERR_SCRIPT),
@@ -2073,6 +2072,153 @@ impl<'tx, 'script> Interpreter<'tx, 'script> {
                 .is_ok()
         });
         Ok(is_valid)
+    }
+
+    fn apply_legacy_find_and_delete(
+        &mut self,
+        script_code: &Script,
+        signatures: &[&[u8]],
+    ) -> Result<ScriptBuf, Error> {
+        let mut script_bytes = script_code.as_bytes().to_vec();
+        for signature in signatures {
+            let sig_push = single_push_script(signature).map_err(|_| Error::ERR_SCRIPT)?;
+            let (filtered, removed) = find_and_delete(&script_bytes, sig_push.as_bytes());
+            if removed > 0 && self.flags.bits() & VERIFY_CONST_SCRIPTCODE != 0 {
+                return Err(self.fail(ScriptError::SigFindAndDelete));
+            }
+            script_bytes = filtered;
+        }
+        Ok(ScriptBuf::from_bytes(script_bytes))
+    }
+
+    fn segwit_v0_signature_hash(
+        &mut self,
+        script_code: &Script,
+        raw_sighash_type: u32,
+    ) -> Result<SegwitV0Sighash, Error> {
+        // Match Bitcoin Core's WITNESS_V0 SignatureHash path exactly by committing the raw
+        // hashtype byte and branching on the raw low 5 bits.
+        const SIGHASH_ANYONECANPAY: u32 = 0x80;
+        const SIGHASH_BASE_MASK: u32 = 0x1f;
+        const SIGHASH_NONE: u32 = 0x02;
+        const SIGHASH_SINGLE: u32 = 0x03;
+
+        let precomputed = self.ensure_precomputed().clone();
+        let tx = self.tx_ctx.tx();
+        let txin = tx.input.get(self.input_index).ok_or(Error::ERR_SCRIPT)?;
+        let base_sighash = raw_sighash_type & SIGHASH_BASE_MASK;
+
+        let zero_hash = sha256d::Hash::all_zeros();
+        let hash_prevouts = if raw_sighash_type & SIGHASH_ANYONECANPAY == 0 {
+            precomputed
+                .hash_prevouts
+                .unwrap_or_else(|| Self::hash_prevouts_double_sha(tx))
+        } else {
+            zero_hash
+        };
+        let hash_sequence = if raw_sighash_type & SIGHASH_ANYONECANPAY == 0
+            && base_sighash != SIGHASH_SINGLE
+            && base_sighash != SIGHASH_NONE
+        {
+            precomputed
+                .hash_sequence
+                .unwrap_or_else(|| Self::hash_sequences_double_sha(tx))
+        } else {
+            zero_hash
+        };
+        let hash_outputs = if base_sighash != SIGHASH_SINGLE && base_sighash != SIGHASH_NONE {
+            precomputed
+                .hash_outputs
+                .unwrap_or_else(|| Self::hash_outputs_double_sha(tx))
+        } else if base_sighash == SIGHASH_SINGLE && self.input_index < tx.output.len() {
+            Self::hash_single_output_double_sha(&tx.output[self.input_index])
+        } else {
+            zero_hash
+        };
+
+        let mut engine = SegwitV0Sighash::engine();
+        tx.version
+            .consensus_encode(&mut engine)
+            .expect("hash engine writes are infallible");
+        hash_prevouts
+            .consensus_encode(&mut engine)
+            .expect("hash engine writes are infallible");
+        hash_sequence
+            .consensus_encode(&mut engine)
+            .expect("hash engine writes are infallible");
+        txin.previous_output
+            .consensus_encode(&mut engine)
+            .expect("hash engine writes are infallible");
+        script_code
+            .consensus_encode(&mut engine)
+            .expect("hash engine writes are infallible");
+        Amount::from_sat(self.amount)
+            .consensus_encode(&mut engine)
+            .expect("hash engine writes are infallible");
+        txin.sequence
+            .consensus_encode(&mut engine)
+            .expect("hash engine writes are infallible");
+        hash_outputs
+            .consensus_encode(&mut engine)
+            .expect("hash engine writes are infallible");
+        tx.lock_time
+            .consensus_encode(&mut engine)
+            .expect("hash engine writes are infallible");
+        raw_sighash_type
+            .consensus_encode(&mut engine)
+            .expect("hash engine writes are infallible");
+
+        Ok(SegwitV0Sighash::from_engine(engine))
+    }
+
+    fn hash_prevouts_double_sha(tx: &Transaction) -> sha256d::Hash {
+        let mut engine = sha256d::Hash::engine();
+        for txin in &tx.input {
+            txin.previous_output
+                .consensus_encode(&mut engine)
+                .expect("hash engine writes are infallible");
+        }
+        sha256d::Hash::from_engine(engine)
+    }
+
+    fn hash_sequences_double_sha(tx: &Transaction) -> sha256d::Hash {
+        let mut engine = sha256d::Hash::engine();
+        for txin in &tx.input {
+            txin.sequence
+                .consensus_encode(&mut engine)
+                .expect("hash engine writes are infallible");
+        }
+        sha256d::Hash::from_engine(engine)
+    }
+
+    fn hash_outputs_double_sha(tx: &Transaction) -> sha256d::Hash {
+        let mut engine = sha256d::Hash::engine();
+        for txout in &tx.output {
+            txout
+                .consensus_encode(&mut engine)
+                .expect("hash engine writes are infallible");
+        }
+        sha256d::Hash::from_engine(engine)
+    }
+
+    fn hash_single_output_double_sha(output: &bitcoin::TxOut) -> sha256d::Hash {
+        let mut engine = sha256d::Hash::engine();
+        output
+            .consensus_encode(&mut engine)
+            .expect("hash engine writes are infallible");
+        sha256d::Hash::from_engine(engine)
+    }
+
+    fn ensure_precomputed(&mut self) -> &PrecomputedTransactionData {
+        if self.precomputed.is_none() {
+            self.precomputed = Some(
+                self.tx_ctx
+                    .build_precomputed(self.spent_outputs.as_ref(), false),
+            );
+        }
+        self.precomputed
+            .as_ref()
+            .expect("precomputed data initialized")
     }
 }
 
@@ -2266,20 +2412,32 @@ fn find_and_delete(script_bytes: &[u8], pattern: &[u8]) -> (Vec<u8>, usize) {
     if script_bytes.len() < pattern.len() {
         return (script_bytes.to_vec(), 0);
     }
-    let mut result = Vec::with_capacity(script_bytes.len());
-    let mut index = 0usize;
+
     let mut removed = 0usize;
-    while index + pattern.len() <= script_bytes.len() {
-        if &script_bytes[index..index + pattern.len()] == pattern {
+    let mut result = Vec::with_capacity(script_bytes.len());
+    let mut pc = 0usize;
+    let mut pc2 = 0usize;
+    let end = script_bytes.len();
+
+    loop {
+        result.extend_from_slice(&script_bytes[pc2..pc]);
+        while pc + pattern.len() <= end && &script_bytes[pc..pc + pattern.len()] == pattern {
+            pc += pattern.len();
             removed += 1;
-            index += pattern.len();
-        } else {
-            result.push(script_bytes[index]);
-            index += 1;
         }
+        pc2 = pc;
+        let Some(next_pc) = next_instruction_offset(script_bytes, pc) else {
+            break;
+        };
+        pc = next_pc;
     }
-    result.extend_from_slice(&script_bytes[index..]);
-    (result, removed)
+
+    if removed > 0 {
+        result.extend_from_slice(&script_bytes[pc2..end]);
+        (result, removed)
+    } else {
+        (script_bytes.to_vec(), 0)
+    }
 }
 
 fn is_canonical_single_push(script_bytes: &[u8]) -> bool {
@@ -2372,9 +2530,50 @@ fn skip_push_data(bytes: &[u8], len: usize, index: &mut usize) -> Result<(), Scr
     Ok(())
 }
 
-/// Mirrors Bitcoin Core's `IsOpSuccess` table (`src/script/script.cpp` in
-/// `~/dev/bitcoin/bitcoin`). Keep this in sync with upstream whenever new
-/// semantics are assigned to the reserved opcodes.
+fn next_instruction_offset(script_bytes: &[u8], offset: usize) -> Option<usize> {
+    if offset >= script_bytes.len() {
+        return None;
+    }
+
+    let opcode = script_bytes[offset];
+    let mut cursor = offset + 1;
+    match opcode {
+        0x01..=0x4b => {
+            let push_len = opcode as usize;
+            cursor = cursor.checked_add(push_len)?;
+            if cursor <= script_bytes.len() {
+                Some(cursor)
+            } else {
+                None
+            }
+        }
+        0x4c => {
+            let len = *script_bytes.get(cursor)? as usize;
+            cursor += 1;
+            cursor = cursor.checked_add(len)?;
+            (cursor <= script_bytes.len()).then_some(cursor)
+        }
+        0x4d => {
+            let bytes = script_bytes.get(cursor..cursor + 2)?;
+            let len = u16::from_le_bytes([bytes[0], bytes[1]]) as usize;
+            cursor += 2;
+            cursor = cursor.checked_add(len)?;
+            (cursor <= script_bytes.len()).then_some(cursor)
+        }
+        0x4e => {
+            let bytes = script_bytes.get(cursor..cursor + 4)?;
+            let len = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) as usize;
+            cursor += 4;
+            cursor = cursor.checked_add(len)?;
+            (cursor <= script_bytes.len()).then_some(cursor)
+        }
+        _ => Some(cursor),
+    }
+}
+
+/// Mirrors Bitcoin Core's `IsOpSuccess` table (`src/script/script.cpp`).
+/// Keep this in sync with upstream whenever new semantics are assigned to
+/// the reserved opcodes.
 fn is_op_success(opcode: Opcode) -> bool {
     matches!(
         opcode.to_u8(),
@@ -2492,7 +2691,7 @@ fn is_defined_hashtype_signature(sig: &[u8]) -> bool {
     if sig.is_empty() {
         return false;
     }
-    let base = sig[sig.len() - 1] & 0x1f;
+    let base = sig[sig.len() - 1] & !0x80;
     matches!(base, 0x01..=0x03)
 }
 
@@ -2530,7 +2729,12 @@ mod tests {
     use crate::{VERIFY_DERSIG, VERIFY_P2SH, VERIFY_SIGPUSHONLY, VERIFY_TAPROOT, VERIFY_WITNESS};
     use bitcoin::{
         blockdata::script::{Builder, PushBytesBuf},
+        consensus,
+        hashes::{sha256, Hash},
+        hex::FromHex,
         opcodes::all,
+        transaction::Version,
+        Amount, OutPoint, Sequence, Transaction, TxIn, TxOut, Witness,
     };
 
     #[test]
@@ -2553,17 +2757,15 @@ mod tests {
     }
 
     #[test]
-    fn witness_flag_enables_helper_bits() {
+    fn witness_flag_does_not_imply_p2sh() {
         let flags = ScriptFlags::from_bits(VERIFY_WITNESS).unwrap();
-        let expected = VERIFY_WITNESS | VERIFY_P2SH;
-        assert_eq!(flags.bits(), expected);
+        assert_eq!(flags.bits(), VERIFY_WITNESS);
     }
 
     #[test]
-    fn taproot_flag_implies_witness_helpers() {
+    fn taproot_flag_does_not_imply_witness_helpers() {
         let flags = ScriptFlags::from_bits(VERIFY_TAPROOT).unwrap();
-        let expected = VERIFY_TAPROOT | VERIFY_WITNESS | VERIFY_P2SH;
-        assert_eq!(flags.bits(), expected);
+        assert_eq!(flags.bits(), VERIFY_TAPROOT);
         assert!(flags.requires_spent_outputs());
     }
 
@@ -2604,6 +2806,118 @@ mod tests {
     }
 
     #[test]
+    fn sigop_counter_rejects_malformed_pushdata() {
+        let malformed = ScriptBuf::from_bytes(vec![all::OP_PUSHDATA1.to_u8(), 0x01]);
+        assert!(count_sigops_bytes(malformed.as_bytes(), true).is_err());
+    }
+
+    #[test]
+    fn witness_v0_p2wpkh_path_charges_single_sigop() {
+        let witness = Witness::from(vec![vec![], vec![0x02; 33]]);
+        let tx = Transaction {
+            version: Version(2),
+            lock_time: bitcoin::absolute::LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint::default(),
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence::MAX,
+                witness,
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(0),
+                script_pubkey: ScriptBuf::new(),
+            }],
+        };
+        let tx_bytes = consensus::serialize(&tx);
+        let tx_ctx = TransactionContext::parse(&tx_bytes).expect("parse tx");
+        let spent_script = Builder::new().push_opcode(all::OP_PUSHNUM_1).into_script();
+        let spend_context = SpendContext::new(spent_script.as_bytes(), None, 0, true);
+        let flags = ScriptFlags::from_bits(VERIFY_WITNESS | VERIFY_P2SH).expect("flags");
+        let mut interpreter = Interpreter::new(&tx_ctx, 0, spend_context, flags).expect("interpreter");
+
+        let program = [0u8; 20];
+        let _ = interpreter.execute_witness_program(0, &program, &tx_ctx.tx().input[0].witness, false);
+        assert_eq!(interpreter.sigops, 1);
+    }
+
+    #[test]
+    fn witness_v0_p2wsh_path_charges_redeem_sigops() {
+        let witness_script = Builder::new()
+            .push_opcode(all::OP_CHECKSIG)
+            .push_opcode(all::OP_CHECKSIGVERIFY)
+            .into_script();
+        let witness_script_bytes = witness_script.as_bytes().to_vec();
+        let witness_program = sha256::Hash::hash(&witness_script_bytes);
+        let witness = Witness::from(vec![vec![], vec![0x02; 33], witness_script_bytes]);
+        let tx = Transaction {
+            version: Version(2),
+            lock_time: bitcoin::absolute::LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint::default(),
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence::MAX,
+                witness,
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(0),
+                script_pubkey: ScriptBuf::new(),
+            }],
+        };
+        let tx_bytes = consensus::serialize(&tx);
+        let tx_ctx = TransactionContext::parse(&tx_bytes).expect("parse tx");
+        let spent_script = Builder::new().push_opcode(all::OP_PUSHNUM_1).into_script();
+        let spend_context = SpendContext::new(spent_script.as_bytes(), None, 0, true);
+        let flags = ScriptFlags::from_bits(VERIFY_WITNESS | VERIFY_P2SH).expect("flags");
+        let mut interpreter = Interpreter::new(&tx_ctx, 0, spend_context, flags).expect("interpreter");
+
+        let _ = interpreter.execute_witness_program(
+            0,
+            &witness_program.to_byte_array(),
+            &tx_ctx.tx().input[0].witness,
+            false,
+        );
+        assert_eq!(interpreter.sigops, 2);
+    }
+
+    #[test]
+    fn p2sh_redeem_script_sigops_use_accurate_multisig_count() {
+        let tx = Transaction {
+            version: Version(2),
+            lock_time: bitcoin::absolute::LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint::default(),
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence::MAX,
+                witness: Witness::new(),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(0),
+                script_pubkey: ScriptBuf::new(),
+            }],
+        };
+        let tx_bytes = consensus::serialize(&tx);
+        let tx_ctx = TransactionContext::parse(&tx_bytes).expect("parse tx");
+        let spent_script = Builder::new().push_opcode(all::OP_PUSHNUM_1).into_script();
+        let spend_context = SpendContext::new(spent_script.as_bytes(), None, 0, true);
+        let flags = ScriptFlags::from_bits(VERIFY_P2SH).expect("flags");
+        let mut interpreter = Interpreter::new(&tx_ctx, 0, spend_context, flags).expect("interpreter");
+
+        let key1 = PushBytesBuf::try_from(vec![0x02; 33]).unwrap();
+        let key2 = PushBytesBuf::try_from(vec![0x03; 33]).unwrap();
+        let redeem_script = Builder::new()
+            .push_opcode(all::OP_PUSHNUM_2)
+            .push_slice(key1)
+            .push_slice(key2)
+            .push_opcode(all::OP_PUSHNUM_2)
+            .push_opcode(all::OP_CHECKMULTISIG)
+            .into_script();
+        interpreter
+            .add_sigops_from_script(redeem_script.as_bytes(), true)
+            .expect("sigop counting");
+        assert_eq!(interpreter.sigops, 2);
+    }
+
+    #[test]
     fn find_and_delete_matches_whole_pushes() {
         let pattern = single_push_script(&[0x02, 0x03]).unwrap();
         let script = Builder::new()
@@ -2628,6 +2942,183 @@ mod tests {
     }
 
     #[test]
+    fn find_and_delete_matches_only_instruction_boundaries() {
+        let pattern = single_push_script(&[]).unwrap();
+        let script = ScriptBuf::from_bytes(vec![0x02, 0x00, 0x11, 0x00]);
+        let (stripped, removed) = find_and_delete(script.as_bytes(), pattern.as_bytes());
+        assert_eq!(removed, 1);
+        assert_eq!(stripped, vec![0x02, 0x00, 0x11]);
+    }
+
+    #[test]
+    fn find_and_delete_core_edge_cases_matrix() {
+        let check =
+            |script: Vec<u8>, pattern: Vec<u8>, expected: Vec<u8>, expected_removed: usize| {
+                let (stripped, removed) = find_and_delete(&script, &pattern);
+                assert_eq!(removed, expected_removed);
+                assert_eq!(stripped, expected);
+            };
+
+        check(
+            vec![all::OP_PUSHNUM_1.to_u8(), all::OP_PUSHNUM_2.to_u8()],
+            vec![],
+            vec![all::OP_PUSHNUM_1.to_u8(), all::OP_PUSHNUM_2.to_u8()],
+            0,
+        );
+        check(
+            vec![
+                all::OP_PUSHNUM_1.to_u8(),
+                all::OP_PUSHNUM_2.to_u8(),
+                all::OP_PUSHNUM_3.to_u8(),
+            ],
+            vec![all::OP_PUSHNUM_2.to_u8()],
+            vec![all::OP_PUSHNUM_1.to_u8(), all::OP_PUSHNUM_3.to_u8()],
+            1,
+        );
+        check(
+            vec![
+                all::OP_PUSHNUM_3.to_u8(),
+                all::OP_PUSHNUM_1.to_u8(),
+                all::OP_PUSHNUM_3.to_u8(),
+                all::OP_PUSHNUM_3.to_u8(),
+                all::OP_PUSHNUM_4.to_u8(),
+                all::OP_PUSHNUM_3.to_u8(),
+            ],
+            vec![all::OP_PUSHNUM_3.to_u8()],
+            vec![all::OP_PUSHNUM_1.to_u8(), all::OP_PUSHNUM_4.to_u8()],
+            4,
+        );
+        check(
+            Vec::from_hex("0302ff03").unwrap(),
+            Vec::from_hex("0302ff03").unwrap(),
+            vec![],
+            1,
+        );
+        check(
+            Vec::from_hex("0302ff030302ff03").unwrap(),
+            Vec::from_hex("0302ff03").unwrap(),
+            vec![],
+            2,
+        );
+        check(
+            Vec::from_hex("0302ff030302ff03").unwrap(),
+            Vec::from_hex("02").unwrap(),
+            Vec::from_hex("0302ff030302ff03").unwrap(),
+            0,
+        );
+        check(
+            Vec::from_hex("0302ff030302ff03").unwrap(),
+            Vec::from_hex("ff").unwrap(),
+            Vec::from_hex("0302ff030302ff03").unwrap(),
+            0,
+        );
+        check(
+            Vec::from_hex("0302ff030302ff03").unwrap(),
+            Vec::from_hex("03").unwrap(),
+            Vec::from_hex("02ff0302ff03").unwrap(),
+            2,
+        );
+        check(
+            Vec::from_hex("02feed5169").unwrap(),
+            Vec::from_hex("feed51").unwrap(),
+            Vec::from_hex("02feed5169").unwrap(),
+            0,
+        );
+        check(
+            Vec::from_hex("02feed5169").unwrap(),
+            Vec::from_hex("02feed51").unwrap(),
+            Vec::from_hex("69").unwrap(),
+            1,
+        );
+        check(
+            Vec::from_hex("516902feed5169").unwrap(),
+            Vec::from_hex("feed51").unwrap(),
+            Vec::from_hex("516902feed5169").unwrap(),
+            0,
+        );
+        check(
+            Vec::from_hex("516902feed5169").unwrap(),
+            Vec::from_hex("02feed51").unwrap(),
+            Vec::from_hex("516969").unwrap(),
+            1,
+        );
+        check(
+            vec![
+                all::OP_PUSHBYTES_0.to_u8(),
+                all::OP_PUSHBYTES_0.to_u8(),
+                all::OP_PUSHNUM_1.to_u8(),
+                all::OP_PUSHNUM_1.to_u8(),
+            ],
+            vec![all::OP_PUSHBYTES_0.to_u8(), all::OP_PUSHNUM_1.to_u8()],
+            vec![all::OP_PUSHBYTES_0.to_u8(), all::OP_PUSHNUM_1.to_u8()],
+            1,
+        );
+        check(
+            vec![
+                all::OP_PUSHBYTES_0.to_u8(),
+                all::OP_PUSHBYTES_0.to_u8(),
+                all::OP_PUSHNUM_1.to_u8(),
+                all::OP_PUSHBYTES_0.to_u8(),
+                all::OP_PUSHNUM_1.to_u8(),
+                all::OP_PUSHNUM_1.to_u8(),
+            ],
+            vec![all::OP_PUSHBYTES_0.to_u8(), all::OP_PUSHNUM_1.to_u8()],
+            vec![all::OP_PUSHBYTES_0.to_u8(), all::OP_PUSHNUM_1.to_u8()],
+            2,
+        );
+        check(
+            Vec::from_hex("0003feed").unwrap(),
+            Vec::from_hex("03feed").unwrap(),
+            Vec::from_hex("00").unwrap(),
+            1,
+        );
+        check(
+            Vec::from_hex("0003feed").unwrap(),
+            Vec::from_hex("00").unwrap(),
+            Vec::from_hex("03feed").unwrap(),
+            1,
+        );
+    }
+
+    #[test]
+    fn script_identity_depends_on_script_content() {
+        let a = ScriptBuf::from_bytes(vec![all::OP_PUSHNUM_1.to_u8()]);
+        let b = ScriptBuf::from_bytes(vec![all::OP_PUSHNUM_2.to_u8()]);
+        assert_eq!(a.as_bytes().len(), b.as_bytes().len());
+        assert!(ScriptIdentity::new(a.as_script()) != ScriptIdentity::new(b.as_script()));
+    }
+
+    #[test]
+    fn precomputed_is_lazy_for_no_signature_paths() {
+        let spent_script = Builder::new().push_opcode(all::OP_PUSHNUM_1).into_script();
+        let tx = Transaction {
+            version: Version(2),
+            lock_time: bitcoin::absolute::LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint::default(),
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence::MAX,
+                witness: Witness::new(),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(0),
+                script_pubkey: ScriptBuf::new(),
+            }],
+        };
+        let tx_bytes = consensus::serialize(&tx);
+        let tx_ctx = TransactionContext::parse(&tx_bytes).expect("parse tx");
+        let spend_context = SpendContext::new(spent_script.as_bytes(), None, 0, true);
+        let flags = ScriptFlags::from_bits(0).expect("flags");
+        let mut interpreter = Interpreter::new(&tx_ctx, 0, spend_context, flags).expect("new");
+
+        interpreter.verify().expect("op_true spend should validate");
+        assert!(
+            interpreter.precomputed.is_none(),
+            "precomputed data should not be built when no signature opcodes execute"
+        );
+    }
+
+    #[test]
     fn scriptnum_overflow_maps_to_unknown() {
         let overflow = vec![0x00, 0x00, 0x00, 0x80, 0x00];
         let err = parse_scriptnum(&overflow, false, SCRIPTNUM_MAX_LEN).unwrap_err();
@@ -2641,5 +3132,35 @@ mod tests {
         assert_eq!(err, ScriptError::Unknown);
         let ok = parse_scriptnum(&non_minimal, false, SCRIPTNUM_MAX_LEN).unwrap();
         assert_eq!(ok, 1);
+    }
+
+    #[test]
+    fn strictenc_hashtype_mask_matches_core() {
+        // Core masks only SIGHASH_ANYONECANPAY in strict hashtype checks.
+        assert!(is_defined_hashtype_signature(&[0x01]));
+        assert!(is_defined_hashtype_signature(&[0x81]));
+        assert!(!is_defined_hashtype_signature(&[0x21]));
+        assert!(!is_defined_hashtype_signature(&[0x41]));
+    }
+
+    #[test]
+    fn script_code_materialization_depends_on_sigversion() {
+        let script = Builder::new()
+            .push_opcode(all::OP_PUSHNUM_1)
+            .push_opcode(all::OP_CODESEPARATOR)
+            .push_opcode(all::OP_PUSHNUM_2)
+            .push_opcode(all::OP_CODESEPARATOR)
+            .into_script();
+
+        let base = Interpreter::materialize_script_code(script.as_script(), 0, true)
+            .expect("base script code materializes");
+        assert_eq!(
+            base.as_bytes(),
+            &[all::OP_PUSHNUM_1.to_u8(), all::OP_PUSHNUM_2.to_u8()]
+        );
+
+        let witness_v0 = Interpreter::materialize_script_code(script.as_script(), 0, false)
+            .expect("witness v0 script code materializes");
+        assert_eq!(witness_v0.as_bytes(), script.as_bytes());
     }
 }
