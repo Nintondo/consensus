@@ -292,3 +292,87 @@ Acceptance criteria:
 
 Acceptance criteria:
 - Coverage gaps are explicit at test time, and regressions in harness strictness fail CI.
+
+---
+
+## Phase 5 – Proof-Grade Parity Closure (Pre-Implementation Plan)
+
+Status:
+- Planned. This phase closes the remaining proof-surface gaps identified in the latest deep audit.
+- Goal: move from "strong parity evidence" to "explicitly demonstrated parity coverage" across all major Core consensus test paths.
+
+### Workstreams
+
+#### H. `tx_valid` Differential Projection (No More `differential=0`)
+- [x] Add a projection path in `tests/core_tx_vectors.rs` that runs `tx_valid` entries through `libbitcoinconsensus` whenever declared flags include policy bits unsupported by the differential bridge.
+- [x] Implement deterministic projection rules that map `tx_valid` excluded-flag vectors onto at least one canonical consensus-flag set inside `DIFF_SUPPORTED_FLAGS`.
+- [x] Keep current strict token parsing and skip accounting; extend stats with:
+  - [x] projected-to-diff count
+  - [x] skipped-projection count (with reason)
+- [x] Enforce non-zero differential execution for both corpora (`tx_valid` and `tx_invalid`) in test assertions.
+
+Verification criteria:
+- [x] `cargo test --features core-diff core_tx_valid_differential -- --nocapture` prints `differential > 0` (current snapshot: `differential=120`, `projected_to_diff=120`).
+- [x] `cargo test --features core-diff core_tx_invalid_differential -- --nocapture` still prints `differential > 0` (current snapshot: `differential=70`).
+- [x] No unknown token, no silent downgrade, and no projection ambiguity is left unaccounted.
+
+#### I. Mirror Remaining Core C++ Unit Cases as Dedicated Rust Parity Tests
+- [x] Add dedicated parity tests for uncovered Core unit flows:
+  - [x] `src/test/transaction_tests.cpp:test_witness` mirrored in `tests/core_witness_unit_parity.rs`
+  - [x] `src/test/transaction_tests.cpp:spends_witness_prog` mirrored in `tests/core_witness_unit_parity.rs`
+  - [x] `src/test/sigopcount_tests.cpp:GetTxSigOpCost` mirrored in `tests/core_sigop_surface.rs`
+  - [x] programmatic multisig signing/order paths from `src/test/script_tests.cpp:script_CHECKMULTISIG12` and `src/test/script_tests.cpp:script_CHECKMULTISIG23` mirrored in `tests/core_multisig_unit_parity.rs`
+- [x] Keep each new Rust test annotated with the exact Core source case it mirrors.
+- [x] Add pass/fail path coverage (not only happy paths), including wrong-key/wrong-witness/wrong-redeem variants where present in Core.
+
+Verification criteria:
+- [x] New Rust tests exist and reference their Core counterparts by file + case name.
+- [x] `cargo test --features core-diff` passes with the new suites enabled.
+- [x] For cases with observable verify API results, differential assertions against `libbitcoinconsensus` are included.
+
+#### J. Import and Run a Larger Generated Script-Assets Corpus
+- [x] Replace/augment the tiny curated `tests/data/script_assets_test.json` with a generated large corpus equivalent in spirit to Core's `script_assets_test` usage.  
+  - Implemented via deterministic generation from imported Core tx corpora (`tx_valid.json` + `tx_invalid.json`) in `tests/script_assets.rs`.
+- [x] Support loading a large corpus in CI and local runs without manual patching of test code.  
+  - Default mode auto-generates from vendored Core fixtures; optional override via `SCRIPT_ASSETS_GENERATED_JSON`.
+- [x] Keep the curated mini corpus only as a fast smoke fixture; treat generated corpus as the parity-grade fixture.  
+  - `script_assets_curated_smoke_monotonicity` runs curated fixture, while `script_assets_generated_corpus_monotonicity` runs large generated corpus.
+- [x] Add fixture metadata (source commit/hash/size) and integrity checks similar to existing Core JSON hash pinning.  
+  - Added `tests/data/script_assets_generated_metadata.json` and integrity test `script_assets_generated_metadata_integrity`.
+
+Verification criteria:
+- [x] Test logs show large-corpus execution (case count significantly above curated fixture size).  
+  - Current snapshot: curated `2` cases vs generated `246` cases.
+- [x] `cargo test --features core-diff script_assets` runs both curated-smoke and generated corpus modes.
+- [x] Fixture integrity checks fail on drift and pass on exact snapshot match.
+
+#### K. Direct Bitcoin Core C++ Runtime Differential Harness (Beyond Crate Bridge)
+- [x] Add an optional runtime differential harness that executes comparisons against a locally built Bitcoin Core C++ test/verification surface (not only the Rust `bitcoinconsensus` crate bridge).  
+  - Implemented in `tests/core_cpp_runtime_diff.rs` with two backends:
+    - current Core (v28+): process-backed helper binary linked against Core internals (`tests/core_cpp_helper/core_consensus_helper.cpp`)
+    - legacy fallback: dynamic `libbitcoinconsensus` loading when available.
+- [x] Define adapter boundaries explicitly (input serialization, flags, prevouts, expected result mapping).  
+  - Harness compares per-input pass/fail for `verify_with_flags_detailed` vs C++ runtime execution with deterministic wire-format requests (flags/index/amount/scriptPubKey/tx/spent-outputs).
+- [x] Add deterministic sampling vectors for this harness:
+  - [x] selected `script_tests.json` rows (non-placeholder, consensus-flag subset)
+  - [x] selected `tx_valid.json`/`tx_invalid.json` rows
+  - [x] targeted edge regressions (witness malleation + non-canonical flag-combo precedence; tapscript rows sampled when directly encodable/non-placeholder)
+- [x] Gate the harness behind env/config (so default CI remains stable), but enforce it in parity-audit CI job/profile.  
+  - Default behavior is explicit skip when no runtime backend is available; parity profile uses `CORE_CPP_DIFF_REQUIRED=1`.
+
+Verification criteria:
+- [x] A documented command path runs direct C++ runtime differential checks and reports matched/failed/skipped counts.  
+  - Example:  
+    `BITCOIN_CORE_REPO=/path/to/bitcoin CORE_CPP_DIFF_BUILD_HELPER=1 cargo test --features core-diff --test core_cpp_runtime_diff -- --nocapture`
+- [x] No unchecked mismatch is allowed in the direct harness run for supported vectors.
+- [x] Skip reasons (environment/build/path/tooling) are explicit and fail parity-audit profile unless marked accepted.  
+  - Parity-audit mode: `CORE_CPP_DIFF_REQUIRED=1 CORE_CPP_DIFF_STRICT=1`  
+  - Accepted residual skips can be declared via `CORE_CPP_DIFF_ACCEPTED_SKIPS=<comma-separated-reasons>`.
+  - Current strict snapshot (Core helper backend): `compared_inputs=124`, `script_vectors=48`, `tx_valid_vectors=32`, `tx_invalid_vectors=32`, `targeted_cases=2`, accepted residual `unsupported_flags=492`.
+
+### Phase Exit Gates
+- [x] `tx_valid` and `tx_invalid` both demonstrate non-zero differential counts.
+- [x] All listed uncovered Core unit cases have dedicated Rust mirrors and pass.
+- [x] Generated large script-assets corpus is integrated, hash-pinned, and exercised in parity profile.
+- [x] Direct C++ runtime differential harness runs successfully with zero untriaged mismatches.
+- [x] Roadmap and README parity notes are updated with final coverage numbers and residual accepted caveats (if any).

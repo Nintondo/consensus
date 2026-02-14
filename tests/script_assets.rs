@@ -1,6 +1,7 @@
 mod script_asm;
 
 use bitcoin::{consensus as btc_consensus, hex::FromHex, ScriptBuf, Transaction, TxOut, Witness};
+use bitcoin::hashes::{sha256, Hash};
 use consensus::{
     verify_with_flags_detailed, Utxo, VERIFY_CHECKLOCKTIMEVERIFY, VERIFY_CHECKSEQUENCEVERIFY,
     VERIFY_CLEANSTACK, VERIFY_CONST_SCRIPTCODE, VERIFY_DERSIG, VERIFY_DISCOURAGE_OP_SUCCESS,
@@ -11,8 +12,12 @@ use consensus::{
     VERIFY_WITNESS_PUBKEYTYPE,
 };
 use script_asm::parse_script;
-use serde_json::Value;
-use std::{collections::BTreeMap, env, fs, path::PathBuf};
+use serde_json::{json, Value};
+use std::{
+    collections::BTreeMap,
+    env, fs,
+    path::{Path, PathBuf},
+};
 
 const CORE_TX_VALID: &str = include_str!("data/tx_valid.json");
 const CORE_TX_INVALID: &str = include_str!("data/tx_invalid.json");
@@ -45,7 +50,7 @@ const ALL_TX_VECTOR_FLAGS: u32 = VERIFY_P2SH
     | VERIFY_DISCOURAGE_OP_SUCCESS
     | VERIFY_DISCOURAGE_UPGRADABLE_TAPROOT_VERSION;
 
-fn asset_path() -> PathBuf {
+fn curated_asset_path() -> PathBuf {
     if let Ok(path) = env::var("SCRIPT_ASSETS_TEST_JSON") {
         return PathBuf::from(path);
     }
@@ -53,6 +58,30 @@ fn asset_path() -> PathBuf {
         return PathBuf::from(dir).join("script_assets_test.json");
     }
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/data/script_assets_test.json")
+}
+
+fn generated_asset_path() -> Option<PathBuf> {
+    if let Ok(path) = env::var("SCRIPT_ASSETS_GENERATED_JSON") {
+        return Some(PathBuf::from(path));
+    }
+    if let Ok(dir) = env::var("DIR_UNIT_TEST_DATA") {
+        let candidate = PathBuf::from(dir).join("script_assets_generated.json");
+        if candidate.exists() {
+            return Some(candidate);
+        }
+    }
+    let vendored = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/data/script_assets_generated.json");
+    if vendored.exists() {
+        return Some(vendored);
+    }
+    None
+}
+
+fn generated_metadata_path() -> PathBuf {
+    if let Ok(path) = env::var("SCRIPT_ASSETS_GENERATED_METADATA_JSON") {
+        return PathBuf::from(path);
+    }
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/data/script_assets_generated_metadata.json")
 }
 
 fn all_consensus_flags() -> Vec<u32> {
@@ -150,6 +179,33 @@ enum TxVectorSkipReason {
     UnknownToken(String),
 }
 
+#[derive(Debug)]
+enum GeneratedCorpusSource {
+    BuiltFromCoreVectors,
+    ExternalFile(PathBuf),
+}
+
+#[derive(Default)]
+struct GeneratedCorpusStats {
+    total_vectors: usize,
+    parsed_vectors: usize,
+    generated_success_cases: usize,
+    generated_failure_cases: usize,
+    skipped_badtx: usize,
+    skipped_unknown: usize,
+    skipped_noncanonical: usize,
+    skipped_incompatible_inputs: usize,
+    unknown_token_counts: BTreeMap<String, usize>,
+}
+
+struct GeneratedCorpusMetadata {
+    source_core_commit: String,
+    source_tx_valid_sha256: String,
+    source_tx_invalid_sha256: String,
+    generated_case_count: usize,
+    generated_sha256: String,
+}
+
 #[derive(Default)]
 struct MonotonicityStats {
     total_vectors: usize,
@@ -205,6 +261,108 @@ fn parse_tx_vector_flags(raw: &str) -> TxVectorFlagParse {
     }
 
     TxVectorFlagParse::Parsed(bits)
+}
+
+fn encode_hex(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        out.push(HEX[(byte >> 4) as usize] as char);
+        out.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    out
+}
+
+fn consensus_flags_to_string(flags: u32) -> String {
+    let mut parts = Vec::new();
+    if flags & VERIFY_P2SH != 0 {
+        parts.push("P2SH");
+    }
+    if flags & VERIFY_DERSIG != 0 {
+        parts.push("DERSIG");
+    }
+    if flags & VERIFY_NULLDUMMY != 0 {
+        parts.push("NULLDUMMY");
+    }
+    if flags & VERIFY_CHECKLOCKTIMEVERIFY != 0 {
+        parts.push("CHECKLOCKTIMEVERIFY");
+    }
+    if flags & VERIFY_CHECKSEQUENCEVERIFY != 0 {
+        parts.push("CHECKSEQUENCEVERIFY");
+    }
+    if flags & VERIFY_WITNESS != 0 {
+        parts.push("WITNESS");
+    }
+    if flags & VERIFY_TAPROOT != 0 {
+        parts.push("TAPROOT");
+    }
+    parts.join(",")
+}
+
+fn witness_to_json_array(witness: &Witness) -> Vec<Value> {
+    witness
+        .iter()
+        .map(|item| Value::String(encode_hex(item)))
+        .collect()
+}
+
+fn prevouts_to_json_array(prevouts: &[TxOut]) -> Vec<Value> {
+    prevouts
+        .iter()
+        .map(|txout| Value::String(encode_hex(&btc_consensus::serialize(txout))))
+        .collect()
+}
+
+fn hash_json_entries(entries: &[Value]) -> String {
+    let bytes = serde_json::to_vec(entries).expect("generated script-assets entries serialize");
+    sha256::Hash::hash(&bytes).to_string()
+}
+
+fn parse_generated_corpus_metadata(path: &Path) -> GeneratedCorpusMetadata {
+    let raw = fs::read_to_string(path)
+        .unwrap_or_else(|err| panic!("failed to read generated metadata {}: {err}", path.display()));
+    let value: Value = serde_json::from_str(&raw)
+        .unwrap_or_else(|err| panic!("invalid generated metadata JSON {}: {err}", path.display()));
+    let obj = value
+        .as_object()
+        .unwrap_or_else(|| panic!("generated metadata {} must be an object", path.display()));
+    let source = obj
+        .get("source_fixtures")
+        .and_then(Value::as_object)
+        .unwrap_or_else(|| {
+            panic!(
+                "generated metadata {} missing source_fixtures object",
+                path.display()
+            )
+        });
+
+    GeneratedCorpusMetadata {
+        source_core_commit: obj
+            .get("source_core_commit")
+            .and_then(Value::as_str)
+            .unwrap_or_else(|| panic!("generated metadata {} missing source_core_commit", path.display()))
+            .to_string(),
+        source_tx_valid_sha256: source
+            .get("tx_valid_sha256")
+            .and_then(Value::as_str)
+            .unwrap_or_else(|| panic!("generated metadata {} missing tx_valid_sha256", path.display()))
+            .to_string(),
+        source_tx_invalid_sha256: source
+            .get("tx_invalid_sha256")
+            .and_then(Value::as_str)
+            .unwrap_or_else(|| panic!("generated metadata {} missing tx_invalid_sha256", path.display()))
+            .to_string(),
+        generated_case_count: obj
+            .get("generated_case_count")
+            .and_then(Value::as_u64)
+            .unwrap_or_else(|| panic!("generated metadata {} missing generated_case_count", path.display()))
+            as usize,
+        generated_sha256: obj
+            .get("generated_sha256")
+            .and_then(Value::as_str)
+            .unwrap_or_else(|| panic!("generated metadata {} missing generated_sha256", path.display()))
+            .to_string(),
+    }
 }
 
 fn parse_witness(value: &Value) -> Witness {
@@ -271,6 +429,147 @@ fn parse_tx_vector_prevouts(value: &Value) -> Vec<TxOut> {
         });
     }
     prevouts
+}
+
+fn build_generated_entries_from_core_vectors(
+    vectors: &str,
+    expect_success: bool,
+    entries: &mut Vec<Value>,
+    stats: &mut GeneratedCorpusStats,
+) {
+    let cases: Vec<Value> = serde_json::from_str(vectors).expect("core tx vectors parse");
+    for case in cases {
+        let arr = match case.as_array() {
+            Some(arr) => arr,
+            None => continue,
+        };
+        if arr.len() == 1 && arr[0].is_string() {
+            continue;
+        }
+        if arr.len() != 3 || !arr[0].is_array() || !arr[1].is_string() || !arr[2].is_string() {
+            continue;
+        }
+        stats.total_vectors += 1;
+
+        let flags_str = arr[2].as_str().expect("flags string");
+        let parsed_flags = match parse_tx_vector_flags(flags_str) {
+            TxVectorFlagParse::Parsed(flags) => {
+                stats.parsed_vectors += 1;
+                flags
+            }
+            TxVectorFlagParse::Skip(TxVectorSkipReason::BadTx) => {
+                stats.skipped_badtx += 1;
+                continue;
+            }
+            TxVectorFlagParse::Skip(TxVectorSkipReason::UnknownToken(token)) => {
+                stats.skipped_unknown += 1;
+                *stats.unknown_token_counts.entry(token).or_insert(0) += 1;
+                continue;
+            }
+        };
+
+        let consensus_flags = if expect_success {
+            let included_flags = ALL_TX_VECTOR_FLAGS & !parsed_flags;
+            if fill_flags(included_flags) != included_flags {
+                stats.skipped_noncanonical += 1;
+                continue;
+            }
+            included_flags & CONSENSUS_FLAGS_MASK
+        } else {
+            if fill_flags(parsed_flags) != parsed_flags {
+                stats.skipped_noncanonical += 1;
+                continue;
+            }
+            parsed_flags & CONSENSUS_FLAGS_MASK
+        };
+
+        let flags_field = consensus_flags_to_string(consensus_flags);
+        let prevouts = parse_tx_vector_prevouts(&arr[0]);
+        let prevouts_json = prevouts_to_json_array(&prevouts);
+        let tx_hex = arr[1].as_str().expect("serialized tx string");
+        let tx: Transaction = btc_consensus::deserialize(
+            &Vec::from_hex(tx_hex).expect("core tx vector serialized transaction hex"),
+        )
+        .expect("core tx vector serialized transaction decode");
+
+        if tx.input.len() != prevouts.len() {
+            stats.skipped_incompatible_inputs += 1;
+            continue;
+        }
+
+        for (input_index, txin) in tx.input.iter().enumerate() {
+            let case_result = verify_case(&tx, &prevouts, input_index, consensus_flags);
+            let include = if expect_success {
+                case_result.is_ok()
+            } else {
+                case_result.is_err()
+            };
+            if !include {
+                stats.skipped_incompatible_inputs += 1;
+                continue;
+            }
+
+            let case = if expect_success {
+                stats.generated_success_cases += 1;
+                json!({
+                    "tx": tx_hex,
+                    "prevouts": prevouts_json.clone(),
+                    "index": input_index,
+                    "flags": flags_field.clone(),
+                    "success": {
+                        "scriptSig": encode_hex(txin.script_sig.as_bytes()),
+                        "witness": witness_to_json_array(&txin.witness),
+                    }
+                })
+            } else {
+                stats.generated_failure_cases += 1;
+                json!({
+                    "tx": tx_hex,
+                    "prevouts": prevouts_json.clone(),
+                    "index": input_index,
+                    "flags": flags_field.clone(),
+                    "failure": {
+                        "scriptSig": encode_hex(txin.script_sig.as_bytes()),
+                        "witness": witness_to_json_array(&txin.witness),
+                    }
+                })
+            };
+            entries.push(case);
+        }
+    }
+}
+
+fn generate_script_assets_entries() -> (Vec<Value>, GeneratedCorpusStats) {
+    let mut entries = Vec::new();
+    let mut stats = GeneratedCorpusStats::default();
+    build_generated_entries_from_core_vectors(CORE_TX_VALID, true, &mut entries, &mut stats);
+    build_generated_entries_from_core_vectors(CORE_TX_INVALID, false, &mut entries, &mut stats);
+    (entries, stats)
+}
+
+fn load_script_asset_entries(path: &Path) -> Vec<Value> {
+    let raw = fs::read_to_string(path)
+        .unwrap_or_else(|err| panic!("failed to read script assets file {}: {err}", path.display()));
+    let tests: Value = serde_json::from_str(&raw)
+        .unwrap_or_else(|err| panic!("failed to parse script assets JSON {}: {err}", path.display()));
+    let entries = tests
+        .as_array()
+        .unwrap_or_else(|| panic!("script assets top-level JSON must be an array"));
+    assert!(
+        !entries.is_empty(),
+        "script assets JSON is empty: {}",
+        path.display()
+    );
+    entries.clone()
+}
+
+fn load_or_generate_large_script_assets_entries() -> (Vec<Value>, GeneratedCorpusSource, GeneratedCorpusStats) {
+    if let Some(path) = generated_asset_path() {
+        let entries = load_script_asset_entries(&path);
+        return (entries, GeneratedCorpusSource::ExternalFile(path), GeneratedCorpusStats::default());
+    }
+    let (entries, stats) = generate_script_assets_entries();
+    (entries, GeneratedCorpusSource::BuiltFromCoreVectors, stats)
 }
 
 fn verify_case(
@@ -467,32 +766,7 @@ fn parse_tx_vector_flags_rejects_unknown_tokens() {
     ));
 }
 
-#[test]
-fn script_assets_flag_monotonicity() {
-    let path = asset_path();
-    assert!(
-        path.exists(),
-        "script assets file does not exist: {}",
-        path.display()
-    );
-
-    let raw = fs::read_to_string(&path).unwrap_or_else(|err| {
-        panic!(
-            "failed to read script assets file {}: {err}",
-            path.display()
-        )
-    });
-    let tests: Value = serde_json::from_str(&raw).unwrap_or_else(|err| {
-        panic!(
-            "failed to parse script assets JSON {}: {err}",
-            path.display()
-        )
-    });
-    let entries = tests
-        .as_array()
-        .unwrap_or_else(|| panic!("script assets top-level JSON must be an array"));
-    assert!(!entries.is_empty(), "script assets JSON is empty");
-
+fn run_script_assets_entries_monotonicity(entries: &[Value], label: &str) {
     let consensus_flags = all_consensus_flags();
     for (idx, case) in entries.iter().enumerate() {
         let obj = case
@@ -594,6 +868,115 @@ fn script_assets_flag_monotonicity() {
             }
         }
     }
+
+    println!(
+        "script_assets corpus `{label}` monotonicity coverage: cases={}",
+        entries.len()
+    );
+}
+
+#[test]
+fn script_assets_curated_smoke_monotonicity() {
+    let path = curated_asset_path();
+    assert!(
+        path.exists(),
+        "curated script assets file does not exist: {}",
+        path.display()
+    );
+    let entries = load_script_asset_entries(&path);
+    run_script_assets_entries_monotonicity(&entries, "curated-smoke");
+}
+
+#[test]
+fn script_assets_generated_corpus_monotonicity() {
+    let (entries, source, stats) = load_or_generate_large_script_assets_entries();
+    let label = match &source {
+        GeneratedCorpusSource::BuiltFromCoreVectors => "generated-from-core-vectors".to_string(),
+        GeneratedCorpusSource::ExternalFile(path) => format!("external-generated-file:{}", path.display()),
+    };
+    match source {
+        GeneratedCorpusSource::BuiltFromCoreVectors => {
+            assert!(
+                stats.unknown_token_counts.is_empty(),
+                "generated corpus encountered unknown tx-vector flags: {:?}",
+                stats.unknown_token_counts
+            );
+            assert!(
+                entries.len() > 50,
+                "generated script-assets corpus is too small ({} cases)",
+                entries.len()
+            );
+            println!(
+                "generated script_assets corpus stats: vectors_total={} vectors_parsed={} success_cases={} failure_cases={} skipped_badtx={} skipped_unknown={} skipped_noncanonical={} skipped_incompatible_inputs={}",
+                stats.total_vectors,
+                stats.parsed_vectors,
+                stats.generated_success_cases,
+                stats.generated_failure_cases,
+                stats.skipped_badtx,
+                stats.skipped_unknown,
+                stats.skipped_noncanonical,
+                stats.skipped_incompatible_inputs
+            );
+        }
+        GeneratedCorpusSource::ExternalFile(_) => {
+            println!("using externally supplied generated script_assets corpus");
+        }
+    }
+    run_script_assets_entries_monotonicity(&entries, &label);
+}
+
+#[test]
+fn script_assets_generated_metadata_integrity() {
+    if generated_asset_path().is_some() {
+        eprintln!(
+            "skipping generated metadata integrity check (external SCRIPT_ASSETS_GENERATED_JSON supplied)"
+        );
+        return;
+    }
+
+    let (entries, stats) = generate_script_assets_entries();
+    assert!(
+        stats.unknown_token_counts.is_empty(),
+        "generated corpus encountered unknown tx-vector flags: {:?}",
+        stats.unknown_token_counts
+    );
+
+    let metadata_path = generated_metadata_path();
+    assert!(
+        metadata_path.exists(),
+        "generated metadata file does not exist: {}",
+        metadata_path.display()
+    );
+    let metadata = parse_generated_corpus_metadata(&metadata_path);
+
+    let tx_valid_hash = sha256::Hash::hash(CORE_TX_VALID.as_bytes()).to_string();
+    let tx_invalid_hash = sha256::Hash::hash(CORE_TX_INVALID.as_bytes()).to_string();
+    assert_eq!(
+        metadata.source_tx_valid_sha256, tx_valid_hash,
+        "generated metadata tx_valid hash mismatch in {}",
+        metadata_path.display()
+    );
+    assert_eq!(
+        metadata.source_tx_invalid_sha256, tx_invalid_hash,
+        "generated metadata tx_invalid hash mismatch in {}",
+        metadata_path.display()
+    );
+    assert_eq!(
+        metadata.generated_case_count,
+        entries.len(),
+        "generated metadata case-count mismatch in {}",
+        metadata_path.display()
+    );
+    assert_eq!(
+        metadata.generated_sha256,
+        hash_json_entries(&entries),
+        "generated metadata corpus hash mismatch in {}",
+        metadata_path.display()
+    );
+    assert!(
+        !metadata.source_core_commit.is_empty(),
+        "generated metadata source_core_commit must be non-empty"
+    );
 }
 
 #[test]

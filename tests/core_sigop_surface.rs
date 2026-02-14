@@ -50,8 +50,9 @@ fn assert_surface_parity(
     );
 }
 
+// Mirrors Bitcoin Core src/test/sigopcount_tests.cpp:GetTxSigOpCost (P2WPKH section).
 #[test]
-fn p2wpkh_witness_toggle_matches_core() {
+fn core_sigopcount_gettxsigopcost_p2wpkh_witness_toggle() {
     let script_pubkey = Builder::new()
         .push_opcode(all::OP_PUSHBYTES_0)
         .push_slice(PushBytesBuf::try_from(vec![0x11; 20]).unwrap())
@@ -62,8 +63,9 @@ fn p2wpkh_witness_toggle_matches_core() {
     assert_surface_parity(&script_pubkey, &tx, VERIFY_P2SH | VERIFY_WITNESS, false);
 }
 
+// Mirrors Bitcoin Core src/test/sigopcount_tests.cpp:GetTxSigOpCost (P2WSH section).
 #[test]
-fn p2wsh_witness_toggle_matches_core() {
+fn core_sigopcount_gettxsigopcost_p2wsh_witness_toggle() {
     let witness_script = Builder::new()
         .push_opcode(all::OP_PUSHNUM_1)
         .push_slice(PushBytesBuf::try_from(vec![0x02; 33]).unwrap())
@@ -85,8 +87,9 @@ fn p2wsh_witness_toggle_matches_core() {
     assert_surface_parity(&script_pubkey, &tx, VERIFY_P2SH | VERIFY_WITNESS, false);
 }
 
+// Mirrors Bitcoin Core src/test/sigopcount_tests.cpp:GetTxSigOpCost (P2SH-P2WSH section).
 #[test]
-fn p2sh_p2wsh_witness_toggle_matches_core() {
+fn core_sigopcount_gettxsigopcost_p2sh_p2wsh_witness_toggle() {
     let witness_script = Builder::new()
         .push_opcode(all::OP_PUSHNUM_1)
         .push_slice(PushBytesBuf::try_from(vec![0x02; 33]).unwrap())
@@ -117,8 +120,10 @@ fn p2sh_p2wsh_witness_toggle_matches_core() {
     assert_surface_parity(&script_pubkey, &tx, VERIFY_P2SH | VERIFY_WITNESS, false);
 }
 
+// Mirrors Bitcoin Core src/test/sigopcount_tests.cpp:GetTxSigOpCost
+// (witness version != 0 contributes zero sigops in this surface check).
 #[test]
-fn witness_v1_program_without_taproot_flag_matches_core() {
+fn core_sigopcount_gettxsigopcost_witness_v1_surface() {
     let script_pubkey = Builder::new()
         .push_opcode(all::OP_PUSHNUM_1)
         .push_slice(PushBytesBuf::try_from(vec![0x42; 32]).unwrap())

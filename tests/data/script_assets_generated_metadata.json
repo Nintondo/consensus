@@ -1,0 +1,10 @@
+{
+  "schema_version": 1,
+  "source_core_commit": "4d7d5f6b79d4c11c47e7a828d81296918fd11d4d",
+  "source_fixtures": {
+    "tx_valid_sha256": "ff64dc1f77d1970b7767ec15630903024c1aa9efd3a6201ab0ade6bf78a4ad63",
+    "tx_invalid_sha256": "0c02ce44ff3a880458f9569a25589315a07f924fcaadac828613d4615776ca52"
+  },
+  "generated_case_count": 246,
+  "generated_sha256": "2e5f7156acdad3c7f7c7a31b7815dba08d2f04d5dc14a14e16b0fe4d6d9e4a1c"
+}

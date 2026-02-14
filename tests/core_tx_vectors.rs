@@ -67,8 +67,26 @@ struct DiffCoverageStats {
     total_vectors: usize,
     checked_vectors: usize,
     differential_vectors: usize,
+    projected_to_diff_vectors: usize,
+    skipped_projection_vectors: usize,
     skipped_badtx: usize,
     unknown_token_counts: BTreeMap<String, usize>,
+    projection_skip_reasons: BTreeMap<String, usize>,
+}
+
+#[derive(Debug)]
+enum ProjectionSkipReason {
+    NonCanonicalProjectedFlags { projected_flags: u32 },
+}
+
+impl ProjectionSkipReason {
+    fn key(&self) -> String {
+        match self {
+            Self::NonCanonicalProjectedFlags { projected_flags } => {
+                format!("noncanonical_projected_flags:{projected_flags:#x}")
+            }
+        }
+    }
 }
 
 fn parse_flags(raw: &str) -> Result<u32, FlagParseError> {
@@ -123,6 +141,16 @@ fn fill_flags(flags: u32) -> u32 {
         out |= VERIFY_P2SH;
     }
     out
+}
+
+fn project_tx_valid_diff_flags(direct_flags: u32) -> Result<u32, ProjectionSkipReason> {
+    let projected = direct_flags & DIFF_SUPPORTED_FLAGS;
+    if fill_flags(projected) != projected {
+        return Err(ProjectionSkipReason::NonCanonicalProjectedFlags {
+            projected_flags: projected,
+        });
+    }
+    Ok(projected)
 }
 
 fn parse_prevouts(raw_inputs: &[Value]) -> HashMap<OutPoint, PrevoutData> {
@@ -352,6 +380,18 @@ fn run_tx_vector_file(vectors: &str, expect_success: bool) {
         if direct_flags & !DIFF_SUPPORTED_FLAGS == 0 {
             run_case_differential(&tx, &prevouts, direct_flags, tx_hex);
             stats.differential_vectors += 1;
+        } else if expect_success {
+            match project_tx_valid_diff_flags(direct_flags) {
+                Ok(projected_flags) => {
+                    run_case_differential(&tx, &prevouts, projected_flags, tx_hex);
+                    stats.differential_vectors += 1;
+                    stats.projected_to_diff_vectors += 1;
+                }
+                Err(reason) => {
+                    stats.skipped_projection_vectors += 1;
+                    *stats.projection_skip_reasons.entry(reason.key()).or_insert(0) += 1;
+                }
+            }
         }
     }
 
@@ -366,16 +406,30 @@ fn run_tx_vector_file(vectors: &str, expect_success: bool) {
         "unknown tx-vector flag tokens encountered: {:?}",
         stats.unknown_token_counts
     );
-    if !expect_success {
+    assert!(
+        stats.differential_vectors > 0,
+        "core tx vectors executed no libbitcoinconsensus differential checks"
+    );
+    if expect_success {
         assert!(
-            stats.differential_vectors > 0,
-            "core tx vectors executed no libbitcoinconsensus differential checks"
+            stats.projected_to_diff_vectors > 0,
+            "core tx-valid vectors executed no projected differential checks"
         );
     }
+    assert!(
+        stats.projection_skip_reasons.is_empty(),
+        "tx-valid differential projection skipped vectors: {:?}",
+        stats.projection_skip_reasons
+    );
 
     println!(
-        "core_tx_vectors coverage: total={} checked={} differential={} skipped_badtx={}",
-        stats.total_vectors, stats.checked_vectors, stats.differential_vectors, stats.skipped_badtx,
+        "core_tx_vectors coverage: total={} checked={} differential={} projected_to_diff={} skipped_projection={} skipped_badtx={}",
+        stats.total_vectors,
+        stats.checked_vectors,
+        stats.differential_vectors,
+        stats.projected_to_diff_vectors,
+        stats.skipped_projection_vectors,
+        stats.skipped_badtx,
     );
 }
 
@@ -408,4 +462,39 @@ fn parse_flags_rejects_unknown_tokens() {
         parse_flags("P2SH,STRICTENC").expect("policy token parses"),
         VERIFY_P2SH | VERIFY_STRICTENC
     );
+}
+
+#[test]
+fn project_tx_valid_diff_flags_keeps_supported_flags() {
+    let direct = VERIFY_P2SH | VERIFY_DERSIG | VERIFY_CHECKLOCKTIMEVERIFY | VERIFY_WITNESS;
+    assert_eq!(
+        project_tx_valid_diff_flags(direct).expect("projection should succeed"),
+        direct
+    );
+}
+
+#[test]
+fn project_tx_valid_diff_flags_strips_policy_flags() {
+    let direct = VERIFY_P2SH
+        | VERIFY_WITNESS
+        | VERIFY_DERSIG
+        | VERIFY_CLEANSTACK
+        | VERIFY_STRICTENC
+        | VERIFY_MINIMALDATA
+        | VERIFY_NULLFAIL;
+    assert_eq!(
+        project_tx_valid_diff_flags(direct).expect("projection should succeed"),
+        VERIFY_P2SH | VERIFY_WITNESS | VERIFY_DERSIG
+    );
+}
+
+#[test]
+fn project_tx_valid_diff_flags_rejects_noncanonical_projection() {
+    let reason = project_tx_valid_diff_flags(VERIFY_WITNESS).expect_err("projection must reject");
+    assert!(matches!(
+        reason,
+        ProjectionSkipReason::NonCanonicalProjectedFlags {
+            projected_flags: VERIFY_WITNESS
+        }
+    ));
 }

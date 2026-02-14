@@ -5,7 +5,7 @@ Pure Rust implementation of Bitcoin's `libbitcoinconsensus` verification surface
 ## Status
 
 - Legacy, P2SH, SegWit v0, and Taproot/Tapscript verification paths are implemented.
-- Differential testing against `libbitcoinconsensus` is available behind `core-diff`.
+- Differential testing against Bitcoin Core runtime surfaces is available behind `core-diff`.
 - Core vector suites are vendored in-tree and exercised by tests.
 
 ## Features
@@ -22,7 +22,7 @@ Pure Rust implementation of Bitcoin's `libbitcoinconsensus` verification surface
 
 - `std` (default)
 - `external-secp` (implies `std`)
-- `core-diff` (enables `bitcoinconsensus` differential tests/benchmarks)
+- `core-diff` (enables Core differential tests/benchmarks)
 
 ## Quick Start
 
@@ -42,6 +42,34 @@ If you want fixture source checks against your local Bitcoin Core checkout:
 
 ```bash
 BITCOIN_CORE_REPO=/path/to/bitcoin cargo test --test core_fixture_hashes
+```
+
+Direct C++ runtime differential harness for current Core (v28+):
+
+```bash
+BITCOIN_CORE_REPO=/path/to/bitcoin \
+CORE_CPP_DIFF_BUILD_HELPER=1 \
+cargo test --features core-diff --test core_cpp_runtime_diff -- --nocapture
+```
+
+Or prebuild once and point directly at the helper binary:
+
+```bash
+cmake -S tests/core_cpp_helper -B /tmp/core_cpp_helper -DBITCOIN_CORE_REPO=/path/to/bitcoin
+cmake --build /tmp/core_cpp_helper --target core_consensus_helper -j4
+CORE_CPP_DIFF_HELPER_BIN=/tmp/core_cpp_helper/core_consensus_helper \
+cargo test --features core-diff --test core_cpp_runtime_diff -- --nocapture
+```
+
+Parity-audit mode (fail if backend is missing and fail on unaccepted skips):
+
+```bash
+BITCOIN_CORE_REPO=/path/to/bitcoin \
+CORE_CPP_DIFF_BUILD_HELPER=1 \
+CORE_CPP_DIFF_REQUIRED=1 \
+CORE_CPP_DIFF_STRICT=1 \
+CORE_CPP_DIFF_ACCEPTED_SKIPS=unsupported_flags \
+cargo test --features core-diff --test core_cpp_runtime_diff -- --nocapture
 ```
 
 ## Benchmarks
