@@ -345,7 +345,7 @@ mod tests {
             self, constants, ecdsa::Signature as EcdsaSignature, Keypair, Message, Parity,
             Secp256k1, SecretKey,
         },
-        sighash::{EcdsaSighashType, Prevouts, SegwitV0Sighash, SighashCache, TapSighashType},
+        sighash::{Annex, EcdsaSighashType, Prevouts, SegwitV0Sighash, SighashCache, TapSighashType},
         taproot::{TapLeafHash, TapNodeHash, TAPROOT_ANNEX_PREFIX, TAPROOT_LEAF_TAPSCRIPT},
         transaction::Version,
         Amount, OutPoint, Sequence, Transaction, TxIn, TxOut, Witness,
@@ -1596,6 +1596,106 @@ mod tests {
     }
 
     #[test]
+    fn taproot_keypath_annex_affects_sighash() {
+        let secp = Secp256k1::new();
+        let keypair = Keypair::from_seckey_slice(&secp, &[35u8; 32]).unwrap();
+        let (xonly, _) = keypair.x_only_public_key();
+        let spent_script = Builder::new()
+            .push_opcode(all::OP_PUSHNUM_1)
+            .push_slice(PushBytesBuf::try_from(xonly.serialize().to_vec()).unwrap())
+            .into_script();
+        let amount = Amount::from_sat(50_000);
+        let annex = vec![TAPROOT_ANNEX_PREFIX, 0x2a];
+
+        let sig_without_annex =
+            sign_taproot_keypath_spend(&secp, &keypair, &spent_script, amount, None);
+        run_taproot_verification(
+            spent_script.clone(),
+            Witness::from(vec![sig_without_annex.clone()]),
+            VERIFY_TAPROOT,
+        )
+        .expect("key-path signature without annex validates");
+
+        let err = run_taproot_verification(
+            spent_script.clone(),
+            Witness::from(vec![sig_without_annex, annex.clone()]),
+            VERIFY_TAPROOT,
+        )
+        .expect_err("adding annex changes key-path sighash");
+        assert_eq!(err, ScriptError::SchnorrSig);
+
+        let sig_with_annex =
+            sign_taproot_keypath_spend(&secp, &keypair, &spent_script, amount, Some(&annex));
+        run_taproot_verification(
+            spent_script,
+            Witness::from(vec![sig_with_annex, annex]),
+            VERIFY_TAPROOT,
+        )
+        .expect("key-path signature with annex validates");
+    }
+
+    #[test]
+    fn taproot_scriptpath_annex_affects_sighash() {
+        let secp = Secp256k1::new();
+        let keypair = Keypair::from_seckey_slice(&secp, &[36u8; 32]).unwrap();
+        let (xonly, _) = keypair.x_only_public_key();
+        let script = Builder::new().push_opcode(all::OP_CHECKSIG).into_script();
+        let (spent_script, template) =
+            taproot_script_fixture(TAPROOT_LEAF_TAPSCRIPT, script.clone(), Vec::new(), true);
+        let annex = template
+            .iter()
+            .last()
+            .expect("annex item")
+            .to_vec();
+        let amount = Amount::from_sat(50_000);
+
+        let sig_without_annex =
+            sign_tapscript_spend(&secp, &keypair, &script, &spent_script, amount);
+        let witness = taproot_witness_from_template(
+            vec![sig_without_annex, xonly.serialize().to_vec()],
+            &template,
+        );
+        let err = run_taproot_verification(spent_script.clone(), witness, VERIFY_TAPROOT)
+            .expect_err("annex must commit into tapscript sighash");
+        assert_eq!(err, ScriptError::EvalFalse);
+
+        let sig_with_annex = sign_tapscript_spend_with_annex(
+            &secp,
+            &keypair,
+            &script,
+            &spent_script,
+            amount,
+            Some(&annex),
+        );
+        let witness =
+            taproot_witness_from_template(vec![sig_with_annex, xonly.serialize().to_vec()], &template);
+        run_taproot_verification(spent_script, witness, VERIFY_TAPROOT | VERIFY_CLEANSTACK)
+            .expect("annex-aware tapscript signature validates");
+    }
+
+    #[test]
+    fn taproot_no_10000_script_size_limit() {
+        let mut bytes = vec![all::OP_NOP.to_u8(); 10_001];
+        bytes.push(all::OP_PUSHNUM_1.to_u8());
+        let script = ScriptBuf::from_bytes(bytes);
+        let (spent_script, witness) =
+            taproot_script_fixture(TAPROOT_LEAF_TAPSCRIPT, script, Vec::new(), false);
+        run_taproot_verification(spent_script, witness, VERIFY_TAPROOT | VERIFY_CLEANSTACK)
+            .expect("tapscript scripts over 10k bytes remain valid");
+    }
+
+    #[test]
+    fn taproot_no_201_opcode_limit() {
+        let mut bytes = vec![all::OP_NOP.to_u8(); 250];
+        bytes.push(all::OP_PUSHNUM_1.to_u8());
+        let script = ScriptBuf::from_bytes(bytes);
+        let (spent_script, witness) =
+            taproot_script_fixture(TAPROOT_LEAF_TAPSCRIPT, script, Vec::new(), false);
+        run_taproot_verification(spent_script, witness, VERIFY_TAPROOT | VERIFY_CLEANSTACK)
+            .expect("tapscript ignores legacy 201-opcode limit");
+    }
+
+    #[test]
     fn taproot_control_length_checked() {
         let script = Builder::new().push_opcode(all::OP_PUSHNUM_1).into_script();
         let (spent_script, witness) =
@@ -1607,6 +1707,41 @@ mod tests {
         let err = run_taproot_verification(spent_script, malformed, VERIFY_TAPROOT)
             .expect_err("invalid control size rejected");
         assert_eq!(err, ScriptError::TaprootWrongControlSize);
+    }
+
+    #[test]
+    fn taproot_control_path_with_multiple_nodes_succeeds() {
+        let script = Builder::new().push_opcode(all::OP_PUSHNUM_1).into_script();
+        let path = [[1u8; 32], [2u8; 32], [3u8; 32]];
+        let (spent_script, witness) = taproot_script_fixture_with_path(
+            TAPROOT_LEAF_TAPSCRIPT,
+            script,
+            Vec::new(),
+            &path,
+            false,
+        );
+        run_taproot_verification(spent_script, witness, VERIFY_TAPROOT | VERIFY_CLEANSTACK)
+            .expect("multi-node control path validates");
+    }
+
+    #[test]
+    fn taproot_control_path_merkle_bitflip_fails() {
+        let script = Builder::new().push_opcode(all::OP_PUSHNUM_1).into_script();
+        let path = [[7u8; 32], [8u8; 32]];
+        let (spent_script, witness) = taproot_script_fixture_with_path(
+            TAPROOT_LEAF_TAPSCRIPT,
+            script,
+            Vec::new(),
+            &path,
+            false,
+        );
+        let mut items: Vec<Vec<u8>> = witness.iter().map(|elem| elem.to_vec()).collect();
+        let control = items.last_mut().expect("control block");
+        control[40] ^= 0x01;
+        let err =
+            run_taproot_verification(spent_script, Witness::from(items), VERIFY_TAPROOT | VERIFY_CLEANSTACK)
+                .expect_err("bit-flipped control path invalidates commitment");
+        assert_eq!(err, ScriptError::WitnessProgramMismatch);
     }
 
     #[test]
@@ -1722,6 +1857,24 @@ mod tests {
     }
 
     #[test]
+    fn taproot_validation_weight_charges_upgradable_pubkeys() {
+        let mut builder = Builder::new();
+        for _ in 0..8 {
+            builder = builder
+                .push_opcode(all::OP_2DUP)
+                .push_opcode(all::OP_CHECKSIGVERIFY);
+        }
+        let script = builder.push_opcode(all::OP_CHECKSIG).into_script();
+        let (spent_script, template) =
+            taproot_script_fixture(TAPROOT_LEAF_TAPSCRIPT, script, Vec::new(), false);
+        let witness =
+            taproot_witness_from_template(vec![vec![1], vec![0x02; 33]], &template);
+        let err = run_taproot_verification(spent_script, witness, VERIFY_TAPROOT)
+            .expect_err("non-empty sigs on upgradable pubkeys must still consume weight");
+        assert_eq!(err, ScriptError::TapscriptValidationWeight);
+    }
+
+    #[test]
     fn taproot_multi_a_checksigadd_pattern() {
         let secp = Secp256k1::new();
         let secrets = [[25u8; 32], [26u8; 32], [27u8; 32]];
@@ -1820,7 +1973,7 @@ mod tests {
         let witness = taproot_witness_from_template(Vec::new(), &template);
         let err = run_taproot_verification(spent_script, witness, VERIFY_TAPROOT)
             .expect_err("tapscript enforces minimal-if regardless of flags");
-        assert_eq!(err, ScriptError::MinimalIf);
+        assert_eq!(err, ScriptError::TapscriptMinimalIf);
     }
 
     #[test]
@@ -1842,10 +1995,145 @@ mod tests {
         assert_eq!(err, ScriptError::DiscourageUpgradablePubkeyType);
     }
 
+    #[test]
+    fn p2sh_wrapped_v1_program_treated_as_reserved_witness() {
+        let redeem = Builder::new()
+            .push_opcode(all::OP_PUSHNUM_1)
+            .push_slice(PushBytesBuf::try_from(vec![0x11; 32]).unwrap())
+            .into_script();
+        let spent_script = ScriptBuf::new_p2sh(&redeem.script_hash());
+        let tx = Transaction {
+            version: Version(2),
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint::default(),
+                script_sig: push_data_script(redeem.as_bytes()),
+                sequence: Sequence::MAX,
+                witness: Witness::new(),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(0),
+                script_pubkey: ScriptBuf::new(),
+            }],
+        };
+        let tx_bytes = consensus::serialize(&tx);
+        let (storage, utxo) = make_utxo(&spent_script, 0);
+        let utxos = [utxo];
+
+        verify_with_flags_detailed(
+            spent_script.as_bytes(),
+            0,
+            &tx_bytes,
+            Some(&utxos),
+            0,
+            VERIFY_P2SH | VERIFY_WITNESS | VERIFY_TAPROOT,
+        )
+        .expect("P2SH-wrapped v1/32 remains reserved and succeeds without discourage flag");
+
+        let failure = verify_with_flags_detailed(
+            spent_script.as_bytes(),
+            0,
+            &tx_bytes,
+            Some(&utxos),
+            0,
+            VERIFY_P2SH
+                | VERIFY_WITNESS
+                | VERIFY_TAPROOT
+                | VERIFY_DISCOURAGE_UPGRADABLE_WITNESS_PROGRAM,
+        )
+        .expect_err("reserved witness version should fail when discouraged");
+        assert_eq!(
+            failure.script_error,
+            ScriptError::DiscourageUpgradableWitnessProgram
+        );
+        drop(storage);
+    }
+
+    #[test]
+    fn pay_to_anchor_allowed_even_with_discourage_flag() {
+        let anchor_program = PushBytesBuf::try_from(vec![0x4e, 0x73]).unwrap();
+        let spent_script = Builder::new()
+            .push_opcode(all::OP_PUSHNUM_1)
+            .push_slice(anchor_program)
+            .into_script();
+        let tx = Transaction {
+            version: Version(2),
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint::default(),
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence::MAX,
+                witness: Witness::new(),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(0),
+                script_pubkey: ScriptBuf::new(),
+            }],
+        };
+        let tx_bytes = consensus::serialize(&tx);
+        verify_with_flags_detailed(
+            spent_script.as_bytes(),
+            0,
+            &tx_bytes,
+            None,
+            0,
+            VERIFY_P2SH | VERIFY_WITNESS | VERIFY_DISCOURAGE_UPGRADABLE_WITNESS_PROGRAM,
+        )
+        .expect("non-P2SH pay-to-anchor is a carveout and must stay valid");
+    }
+
+    #[test]
+    fn p2sh_anchor_fails_when_upgradable_witness_is_discouraged() {
+        let anchor_program = PushBytesBuf::try_from(vec![0x4e, 0x73]).unwrap();
+        let anchor = Builder::new()
+            .push_opcode(all::OP_PUSHNUM_1)
+            .push_slice(anchor_program)
+            .into_script();
+        let spent_script = ScriptBuf::new_p2sh(&anchor.script_hash());
+        let tx = Transaction {
+            version: Version(2),
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint::default(),
+                script_sig: push_data_script(anchor.as_bytes()),
+                sequence: Sequence::MAX,
+                witness: Witness::new(),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(0),
+                script_pubkey: ScriptBuf::new(),
+            }],
+        };
+        let tx_bytes = consensus::serialize(&tx);
+        let failure = verify_with_flags_detailed(
+            spent_script.as_bytes(),
+            0,
+            &tx_bytes,
+            None,
+            0,
+            VERIFY_P2SH | VERIFY_WITNESS | VERIFY_DISCOURAGE_UPGRADABLE_WITNESS_PROGRAM,
+        )
+        .expect_err("nested pay-to-anchor should be treated as reserved witness program");
+        assert_eq!(
+            failure.script_error,
+            ScriptError::DiscourageUpgradableWitnessProgram
+        );
+    }
+
     fn taproot_script_fixture(
         leaf_version: u8,
         script: ScriptBuf,
+        stack_items: Vec<Vec<u8>>,
+        include_annex: bool,
+    ) -> (ScriptBuf, Witness) {
+        taproot_script_fixture_with_path(leaf_version, script, stack_items, &[], include_annex)
+    }
+
+    fn taproot_script_fixture_with_path(
+        leaf_version: u8,
+        script: ScriptBuf,
         mut stack_items: Vec<Vec<u8>>,
+        merkle_path: &[[u8; 32]],
         include_annex: bool,
     ) -> (ScriptBuf, Witness) {
         let internal_key_bytes =
@@ -1860,16 +2148,22 @@ mod tests {
             .consensus_encode(&mut engine)
             .expect("script serialize");
         let tapleaf_hash = TapLeafHash::from_engine(engine);
-        let merkle_root = TapNodeHash::from(tapleaf_hash);
+        let mut merkle_root = TapNodeHash::from(tapleaf_hash);
+        for node in merkle_path {
+            merkle_root = TapNodeHash::from_node_hashes(merkle_root, TapNodeHash::from_byte_array(*node));
+        }
         let (tweaked, parity) = internal_key.tap_tweak(&secp, Some(merkle_root));
         let parity_bit = match parity {
             Parity::Even => 0,
             Parity::Odd => 1,
         };
 
-        let mut control = Vec::with_capacity(33);
+        let mut control = Vec::with_capacity(33 + merkle_path.len() * 32);
         control.push(leaf_version | parity_bit);
         control.extend_from_slice(&internal_key.serialize());
+        for node in merkle_path {
+            control.extend_from_slice(node);
+        }
 
         stack_items.push(script.as_bytes().to_vec());
         stack_items.push(control);
@@ -1943,6 +2237,17 @@ mod tests {
         spent_script: &ScriptBuf,
         amount: Amount,
     ) -> Vec<u8> {
+        sign_tapscript_spend_with_annex(secp, keypair, script, spent_script, amount, None)
+    }
+
+    fn sign_tapscript_spend_with_annex(
+        secp: &Secp256k1<secp256k1::All>,
+        keypair: &Keypair,
+        script: &ScriptBuf,
+        spent_script: &ScriptBuf,
+        amount: Amount,
+        annex_bytes: Option<&[u8]>,
+    ) -> Vec<u8> {
         let tapleaf_hash = tapscript_leaf_hash(script, TAPROOT_LEAF_TAPSCRIPT);
         let tx = taproot_test_transaction(amount);
         let mut cache = SighashCache::new(&tx);
@@ -1951,15 +2256,45 @@ mod tests {
             script_pubkey: spent_script.clone(),
         };
         let prevouts = vec![prevout];
+        let annex = annex_bytes.map(|bytes| Annex::new(bytes).expect("valid annex"));
         let sighash = cache
             .taproot_signature_hash(
                 0,
                 &Prevouts::All(prevouts.as_slice()),
-                None,
+                annex,
                 Some((tapleaf_hash, u32::MAX)),
                 TapSighashType::Default,
             )
             .expect("taproot sighash");
+        let message = Message::from(sighash);
+        let signature = secp.sign_schnorr_no_aux_rand(&message, keypair);
+        signature.as_ref().to_vec()
+    }
+
+    fn sign_taproot_keypath_spend(
+        secp: &Secp256k1<secp256k1::All>,
+        keypair: &Keypair,
+        spent_script: &ScriptBuf,
+        amount: Amount,
+        annex_bytes: Option<&[u8]>,
+    ) -> Vec<u8> {
+        let tx = taproot_test_transaction(amount);
+        let mut cache = SighashCache::new(&tx);
+        let prevout = TxOut {
+            value: amount,
+            script_pubkey: spent_script.clone(),
+        };
+        let prevouts = vec![prevout];
+        let annex = annex_bytes.map(|bytes| Annex::new(bytes).expect("valid annex"));
+        let sighash = cache
+            .taproot_signature_hash(
+                0,
+                &Prevouts::All(prevouts.as_slice()),
+                annex,
+                None,
+                TapSighashType::Default,
+            )
+            .expect("taproot key-path sighash");
         let message = Message::from(sighash);
         let signature = secp.sign_schnorr_no_aux_rand(&message, keypair);
         signature.as_ref().to_vec()

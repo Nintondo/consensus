@@ -93,6 +93,7 @@ pub enum ScriptError {
     TaprootWrongControlSize,
     TapscriptValidationWeight,
     TapscriptCheckMultiSig,
+    TapscriptMinimalIf,
     SigFindAndDelete,
 }
 
@@ -484,7 +485,8 @@ impl<'tx, 'script> Interpreter<'tx, 'script> {
                 if !txin.script_sig.is_empty() {
                     return Err(self.fail(ScriptError::WitnessMalleated));
                 }
-                let witness_res = self.execute_witness_program(version, program, &txin.witness);
+                let witness_res =
+                    self.execute_witness_program(version, program, &txin.witness, false);
                 self.track_script_error(witness_res)?;
                 let mut stack = ScriptStack::new();
                 self.push_bool_element(&mut stack, true)?;
@@ -518,7 +520,8 @@ impl<'tx, 'script> Interpreter<'tx, 'script> {
                     if txin.script_sig.as_bytes() != expected.as_bytes() {
                         return Err(self.fail(ScriptError::WitnessMalleatedP2SH));
                     }
-                    let witness_res = self.execute_witness_program(version, program, &txin.witness);
+                    let witness_res =
+                        self.execute_witness_program(version, program, &txin.witness, true);
                     self.track_script_error(witness_res)?;
                     stack_copy = ScriptStack::new();
                     self.push_element(&mut stack_copy, vec![1])?;
@@ -618,7 +621,7 @@ impl<'tx, 'script> Interpreter<'tx, 'script> {
         if script_bytes.is_empty() {
             return Ok(());
         }
-        if script_bytes.len() > MAX_SCRIPT_SIZE {
+        if sigversion != SigVersion::Taproot && script_bytes.len() > MAX_SCRIPT_SIZE {
             return Err(self.fail(ScriptError::ScriptSize));
         }
 
@@ -709,7 +712,7 @@ impl<'tx, 'script> Interpreter<'tx, 'script> {
                 ) {
                     return Err(self.fail(ScriptError::DisabledOpcode));
                 }
-                if opcode > all::OP_PUSHNUM_16.to_u8() {
+                if sigversion != SigVersion::Taproot && opcode > all::OP_PUSHNUM_16.to_u8() {
                     self.add_ops(1)?;
                 }
 
@@ -1180,11 +1183,15 @@ impl<'tx, 'script> Interpreter<'tx, 'script> {
                         SigVersion::Taproot => true,
                         SigVersion::Base => false,
                     };
+                    let minimal_if_error = match sigversion {
+                        SigVersion::Taproot => ScriptError::TapscriptMinimalIf,
+                        _ => ScriptError::MinimalIf,
+                    };
                     if enforce_minimal_if
                         && !condition.is_empty()
                         && !is_minimal_if_condition(&condition)
                     {
-                        return Err(self.fail(ScriptError::MinimalIf));
+                        return Err(self.fail(minimal_if_error));
                     }
                     value = cast_to_bool(&condition);
                     if op == OP_NOTIF {
@@ -1666,6 +1673,7 @@ impl<'tx, 'script> Interpreter<'tx, 'script> {
         version: u8,
         program: &[u8],
         witness: &'tx Witness,
+        is_p2sh: bool,
     ) -> Result<(), Error> {
         match version {
             0 => match program.len() {
@@ -1674,8 +1682,10 @@ impl<'tx, 'script> Interpreter<'tx, 'script> {
                 _ => Err(self.fail(ScriptError::WitnessProgramWrongLength)),
             },
             1 => {
-                if program.len() == 32 {
+                if program.len() == 32 && !is_p2sh {
                     self.execute_taproot_program(program, witness)
+                } else if !is_p2sh && is_pay_to_anchor(version, program) {
+                    Ok(())
                 } else if self.flags.bits() & VERIFY_DISCOURAGE_UPGRADABLE_WITNESS_PROGRAM != 0 {
                     Err(self.fail(ScriptError::DiscourageUpgradableWitnessProgram))
                 } else {
@@ -1923,6 +1933,13 @@ impl<'tx, 'script> Interpreter<'tx, 'script> {
         sig_bytes: &[u8],
         pubkey_bytes: &[u8],
     ) -> Result<bool, Error> {
+        let has_signature = !sig_bytes.is_empty();
+        if has_signature {
+            // Core charges validation weight for every non-empty signature before
+            // branching on pubkey type, including upgradable key versions.
+            self.consume_tapscript_sigop()?;
+        }
+
         if pubkey_bytes.is_empty() {
             return Err(self.fail(ScriptError::PubkeyType));
         }
@@ -1931,14 +1948,13 @@ impl<'tx, 'script> Interpreter<'tx, 'script> {
             if self.flags.bits() & VERIFY_DISCOURAGE_UPGRADABLE_PUBKEYTYPE != 0 {
                 return Err(self.fail(ScriptError::DiscourageUpgradablePubkeyType));
             }
-            return Ok(!sig_bytes.is_empty());
+            return Ok(has_signature);
         }
 
-        if sig_bytes.is_empty() {
+        if !has_signature {
             return Ok(false);
         }
 
-        self.consume_tapscript_sigop()?;
         let Some(parts) = self.parse_taproot_signature(sig_bytes)? else {
             return Ok(false);
         };
@@ -2168,6 +2184,10 @@ fn witness_program(script_bytes: &[u8]) -> Option<(u8, &[u8])> {
         return None;
     }
     Some((version.to_num(), &script_bytes[2..]))
+}
+
+fn is_pay_to_anchor(version: u8, program: &[u8]) -> bool {
+    version == 1 && program.len() == 2 && program[0] == 0x4e && program[1] == 0x73
 }
 
 fn single_push_script(

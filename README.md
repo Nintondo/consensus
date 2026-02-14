@@ -7,7 +7,13 @@ This crate aims to stay source-compatible with `rust-bitcoinconsensus` while kee
 ## Current Status
 
 - Active development.
-- Legacy, P2SH, SegWit v0, and large parts of Taproot/Tapscript are implemented.
+- Legacy, P2SH, SegWit v0, and Taproot/Tapscript paths are implemented.
+- Recent Core-parity updates include:
+  - tapscript validation-weight charging for non-empty signatures (including upgradable pubkey types),
+  - BIP341 applicability gate for v1 witness programs (`version=1`, `program_len=32`, non-P2SH),
+  - pay-to-anchor carveout handling (`OP_1 0x024e73`) aligned with Core,
+  - tapscript-specific MINIMALIF diagnostic mapping,
+  - tapscript behavior that does not inherit legacy 10,000-byte script-size or 201-opcode limits.
 - Full parity work is tracked in `docs/integration-roadmap.md`.
 - `CONSENSUS_VERSION` is currently a placeholder (`0`).
 
@@ -62,6 +68,7 @@ cargo bench --bench verification
 - `verify` and `verify_with_details` choose default flags based on whether `spent_outputs` are provided.
 - Taproot verification requires previous outputs (`spent_outputs`), and verification returns `ERR_SPENT_OUTPUTS_REQUIRED` when missing.
 - When `spent_outputs` are provided, the verifier cross-checks the current input scriptPubKey and derives the amount from the matched prevout.
+- Witness v1 dispatch follows Core’s Taproot applicability rules and pay-to-anchor carveout behavior.
 
 ## Minimal Usage Example
 

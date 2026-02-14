@@ -537,6 +537,7 @@ fn parse_expected_error(raw: &str) -> Option<Option<ScriptError>> {
         "PUBKEYTYPE" => PubkeyType,
         "CLEANSTACK" => CleanStack,
         "MINIMALIF" => MinimalIf,
+        "TAPSCRIPT_MINIMALIF" => TapscriptMinimalIf,
         "NULLFAIL" => NullFail,
         "WITNESS_PROGRAM_WRONG_LENGTH" => WitnessProgramWrongLength,
         "WITNESS_PROGRAM_WITNESS_EMPTY" => WitnessProgramWitnessEmpty,
