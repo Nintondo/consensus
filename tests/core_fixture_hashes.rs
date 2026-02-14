@@ -41,7 +41,8 @@ const FIXTURES: &[FixtureHash] = &[
 ];
 
 fn hash_file(path: &Path) -> String {
-    let bytes = fs::read(path).unwrap_or_else(|err| panic!("failed to read {}: {err}", path.display()));
+    let bytes =
+        fs::read(path).unwrap_or_else(|err| panic!("failed to read {}: {err}", path.display()));
     sha256::Hash::hash(&bytes).to_string()
 }
 
@@ -62,10 +63,14 @@ fn vendored_core_fixtures_match_pinned_hashes() {
         let vendored = root.join(fixture.vendored_path);
         let actual = hash_file(&vendored);
         assert_eq!(
-            actual, fixture.sha256_hex,
+            actual,
+            fixture.sha256_hex,
             "vendored fixture hash mismatch for {} (expected {}, got {}). \
              If you intentionally updated this fixture from Core, update the pinned hash in {}.",
-            fixture.vendored_path, fixture.sha256_hex, actual, file!()
+            fixture.vendored_path,
+            fixture.sha256_hex,
+            actual,
+            file!()
         );
     }
 }
@@ -86,7 +91,8 @@ fn vendored_core_fixtures_match_local_core_snapshot_when_available() {
         let vendored_hash = hash_file(&vendored);
         let core_hash = hash_file(&core_file);
         assert_eq!(
-            core_hash, vendored_hash,
+            core_hash,
+            vendored_hash,
             "fixture drift detected: {} != {}. \
              Refresh from Core snapshot (commit {}) or adjust pinned hashes intentionally.",
             core_file.display(),

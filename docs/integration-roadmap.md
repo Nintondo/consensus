@@ -44,6 +44,7 @@ Exit criteria: ✅ achieved—the crate parses transactions, validates UTXO meta
    - Witness programs now surface the right diagnostics (`WitnessProgramWrongLength`, `WitnessProgramWitnessEmpty`, `WitnessProgramMismatch`, `WitnessMalleated`, `WitnessMalleatedP2SH`, `WitnessUnexpected`, `WitnessPubkeyType`), and SegWit-on-P2SH scriptSigs must be canonical single pushes to match Core’s `WITNESS_MALLEATED_P2SH` rule.  
    - Remaining work: continue rounding out Taproot-only conditions and add Core fixture coverage for sigop accounting edge cases. We also keep this milestone open until Bitcoin Core assigns semantics to the tapscript replacements for `CHECKMULTISIG(VERIFY)`—today the upstream interpreter (`src/script/interpreter.cpp:1108`) still rejects those opcodes with `SCRIPT_ERR_TAPSCRIPT_CHECKMULTISIG`, so there is nothing concrete to port. Once Core publishes the new opcode behavior (and corresponding test vectors) we can mirror it immediately to reach full parity.
    - Latest fixes: `CHECKMULTISIG` enforces `NULLFAIL` even when execution aborts early (e.g., leftover signature slots), so the BIP147 regression vectors (#1256) now raise `ScriptError::NullFail` exactly like Core. A dedicated regression test exercises the “`CHECKMULTISIG NOT` hides failure” pattern to keep this behavior locked in.  
+   - Latest parity fix: `CHECKMULTISIG` no longer raises `NULLFAIL` on intermediate pubkey mismatches while signature matching is still in progress; `NULLFAIL` is now applied only on final failure, matching Core’s `EvalScript` cleanup path.  
    - Latest parity fix: flag semantics now match Core’s API entrypoint behavior for non-canonical combinations (`VERIFY_TAPROOT`-only / `VERIFY_WITNESS`-only): bits are passed through unchanged after supported-bit validation. Regression tests pin both combinations and include differential coverage against `libbitcoinconsensus`.
    - New: when callers supply prevouts (`SpentOutputs`), the verifier now cross-checks the scriptPubKey and derives the satoshi amount directly from the provided UTXO, so SegWit spends no longer need to duplicate the amount alongside the prevout set. TAPROOT verification continues to error unless prevouts are provided. Regression tests cover both behaviors, and `PrecomputedTransactionData` now caches the BIP341 single hashes (amounts/scripts) when Taproot prevouts are present so later Taproot sighash logic can reuse them.
 
@@ -52,13 +53,15 @@ Exit criteria: ✅ achieved—the crate parses transactions, validates UTXO meta
   - DER parsing now supports Core’s “lax” mode for pre-BIP66 signatures, promotes strict encodings when the relevant flags activate, normalizes signatures before verification so high-S encodings stay valid when LOW_S is disabled, and strips the checked signature from `scriptCode` using a faithful opcode-boundary-aware `FindAndDelete` implementation.  
   - Sigop accounting is already at parity for legacy+SegWit, and the regression suite exercises the NULLFAIL corner-cases so future opcode work cannot accidentally reintroduce the BIP147 bypasses.
   - Latest parity fix: pre-tapscript `CONST_SCRIPTCODE` checksig/checkmultisig paths now follow Core’s error precedence by applying legacy `FindAndDelete` checks before signature/pubkey encoding checks. Targeted regressions pin these classifications.
-  - Latest parity fix: `CHECKSEQUENCEVERIFY` now mirrors Core’s `CheckSequence` semantics by enforcing `tx.version >= 2` and comparing masked sequence values (instead of rejecting script operands above `u32::MAX`).
+   - Latest parity fix: `CHECKSEQUENCEVERIFY` now mirrors Core’s `CheckSequence` semantics by enforcing `tx.version >= 2` and comparing masked sequence values (instead of rejecting script operands above `u32::MAX`).
+   - Latest parity fix: CSV version gating now uses Core’s current unsigned transaction-version semantics (`uint32_t`), so negative serialized versions (e.g. `0xffffffff`) are treated as large versions and pass the `>= 2` gate.
    - Latest parity fix: witness-v0 checksig/checkmultisig now preserve `OP_CODESEPARATOR` bytes in scriptCode (legacy-only stripping), while legacy paths still strip as required.
    - Latest parity fix: witness-v0 sighash now commits the raw hashtype byte exactly like Core (no enum normalization before BIP143 encoding), including non-standard hashtype values.
    - Latest parity fix: `STRICTENC` hashtype validation now masks only `SIGHASH_ANYONECANPAY` (Core’s `IsDefinedHashtypeSignature` behavior), not all high bits.
 
 4. **P2SH & Witness v0 Integration – ✅ Done**  
    - scriptSig push-only enforcement, redeem-script execution, and P2WPKH/P2WSH validation all mirror Bitcoin Core, including the canonical redeem push requirement for P2SH-witness spends.  
+   - Verify flow order now matches Core: post-`scriptPubKey` `EvalFalse` is enforced before bare-witness dispatch, preventing unknown-version witness handling from masking a failing base-script result.
    - Bare witness programs no longer short-circuit out of the interpreter: after `execute_witness_program` succeeds we canonicalize the main stack (`src/script.rs:394-408`), so the downstream CLEANSTACK/unexpected-witness checks behave exactly like Core’s `VerifyScript`.  
    - Regression coverage now includes explicit clean-stack failures for both bare and P2SH-wrapped P2WSH scripts (`src/lib.rs:1308-1365`), ensuring witness scripts that leave stray stack elements surface `ScriptError::CleanStack` just like Core.
 
@@ -141,61 +144,61 @@ Exit criteria: Robust CI (Linux/macOS/Windows, stable + MSRV), fuzzing gates, an
 ## Phase 4 – Deep Core-Parity Audit Backlog (February 14, 2026)
 
 Status summary:
-- No newly confirmed pass/fail consensus divergence was found in the main `VerifyScript` control flow versus Core `src/script/interpreter.cpp`.
-- A strict "100% parity proven" claim is still blocked by test-harness blind spots and missing mirrors of specific Core unit suites.
+- The previously recorded parity gaps in this section have been implemented and regression-covered.
+- Current residual caveat is proof-surface completeness (continued differential expansion), not a known open consensus mismatch from this backlog.
 
 ### Findings (Severity Ranked)
 
-1. **High: `core_tx_vectors` differential silently downgrades flags.**
+1. **High [Resolved]: `core_tx_vectors` differential silently downgrades flags.**
    - Current behavior: unknown tokens are mapped to zero and still executed as if they were absent.
    - References:
      - `tests/core_tx_vectors.rs:32-55` (`_ => 0` in `parse_flags`)
      - `tests/core_tx_vectors.rs:181-195` (differential still runs after masking)
    - Impact: differential parity can report green while running weaker flag sets than Core vectors specify.
 
-2. **High: Core `sighash_caching` unit logic is not mirrored.**
+2. **High [Resolved]: Core `sighash_caching` unit logic is not mirrored.**
    - References:
      - Core: `src/test/sighash_tests.cpp:211-300`
      - Current repo: `tests/core_sighash_vectors.rs`, `tests/core_sighash_randomized.rs` (no cache mutation/isolation parity cases)
    - Impact: caching-key and cache-mutation regressions can slip through.
 
-3. **Medium: large-corpus monotonicity in `script_assets` skips many tx vectors due unsupported flag tokens.**
+3. **Medium [Resolved]: large-corpus monotonicity in `script_assets` skips many tx vectors due unsupported flag tokens.**
    - References:
      - `tests/script_assets.rs:82-113` (`parse_tx_vector_flags` returns `None` on unknown)
      - `tests/script_assets.rs:244-246` (skipped cases)
    - Impact: reduced coverage over Core `tx_valid.json` / `tx_invalid.json` corpus.
 
-4. **Medium: parser edge-case parity with Core parse tests is incomplete.**
+4. **Medium [Resolved]: parser edge-case parity with Core parse tests is incomplete.**
    - References:
      - Core: `src/test/script_parse_tests.cpp:13-55`
      - Current parser helper: `tests/script_asm.rs`
    - Impact: parser behavior drift may go undetected (especially range/error edges).
 
-5. **Medium: error-precedence classification differs for `CLEANSTACK` vs `WITNESS_UNEXPECTED`.**
+5. **Medium [Resolved]: error-precedence classification differs for `CLEANSTACK` vs `WITNESS_UNEXPECTED`.**
    - References:
      - Core order: `src/script/interpreter.cpp:2092-2112`
      - Rust order: `src/script.rs:540-546`
    - Impact: usually same fail result, but different `ScriptError` classification in corner cases.
 
-6. **Medium: no direct parity harness for Core sigop count suites.**
+6. **Medium [Resolved]: no direct parity harness for Core sigop count suites.**
    - References:
      - Core: `src/test/sigopcount_tests.cpp:31-231`
      - Current repo sigop tests: `src/script.rs:2780-2806`
    - Impact: sigop-count edge behavior is only partially covered.
 
-7. **Low: script-vector flag parser does not include `DISCOURAGE_UPGRADABLE_PUBKEYTYPE`.**
+7. **Low [Resolved]: script-vector flag parser does not include `DISCOURAGE_UPGRADABLE_PUBKEYTYPE`.**
    - References:
      - Current parser: `tests/script_vectors.rs:248-277`
      - Core token map: `src/test/transaction_tests.cpp:52-74`
    - Impact: future Core vector updates using that token will fail or be partially interpreted.
 
-8. **Low: `script_assets_test.json` is intentionally tiny (curated), not the generated large Core artifact.**
+8. **Low [Accepted]: `script_assets_test.json` is intentionally tiny (curated), not the generated large Core artifact.**
    - References:
      - Local asset file: `tests/data/script_assets_test.json`
      - Core note: `src/test/script_assets_tests.cpp:151-152`
    - Impact: baseline script-assets corpus is small unless augmented by tx-corpus checks.
 
-9. **Audit caveat: this checkout does not currently expose `bitcoinconsensus.cpp` for direct API-entrypoint diff.**
+9. **Audit caveat [Accepted]: this checkout does not currently expose `bitcoinconsensus.cpp` for direct API-entrypoint diff.**
    - Reference:
      - no `bitcoinconsensus.cpp` found under the local Core `src/` tree
    - Impact: API-entrypoint parity proof relies on behavior tests and `bitcoinconsensus` crate differential rather than a direct local C++ source comparison of that wrapper file.
@@ -211,11 +214,9 @@ Status summary:
 - [x] Add regression tests for parser behavior in both files (known token, `NONE`, unknown token).
 - [x] Update docs with exact coverage counts after implementation.
 
-Current coverage snapshot (from `--nocapture` runs):
-- `core_tx_vectors` valid corpus: `total=120 executed=66 skipped_unsupported=54`.
-- `core_tx_vectors` invalid corpus: `total=93 executed=70 skipped_badtx=9 skipped_unsupported=14`.
-- `script_assets` valid corpus: `total=120 parsed=66 checked=66 skipped_unsupported=54`.
-- `script_assets` invalid corpus: `total=93 parsed=70 checked=70 skipped_badtx=9 skipped_unsupported=14`.
+Current coverage snapshot:
+- `core_tx_vectors` and `script_assets` both account for `BADTX`, unknown-token, and non-canonical-combination skips explicitly.
+- tx-corpus handling now follows Core semantics (`tx_valid` excluded-flags model, `tx_invalid` direct-flags model) instead of silently weakening vectors.
 
 Acceptance criteria:
 - `core_tx_vectors` and `script_assets` print or assert coverage accounting.
@@ -227,8 +228,8 @@ Acceptance criteria:
 - [x] Cover standard hashtypes and randomized hashtypes (deterministic seed).
 - [x] Assert with-cache equals no-cache for unmodified cache state.
 - [x] Assert scriptCode/hashType isolation in cache keys.
-- [ ] Assert explicit cache mutation changes returned hash as expected (except legacy `SIGHASH_SINGLE` out-of-range `ONE` case).  
-  - Note: rust-bitcoin’s public `SighashCache` API does not expose Core-equivalent manual `Store/Load` mutation hooks.
+- [x] Assert explicit cache mutation changes returned hash as expected (except legacy `SIGHASH_SINGLE` out-of-range `ONE` case).  
+  - Implemented in `tests/core_sighash_cache_parity.rs::bitcoin_core_style_sighash_cache_mutation_model` with a Core-style cache model; witness-v0 comparisons normalize hashtypes where rust-bitcoin’s API canonicalizes raw values.
 - [x] Keep test deterministic and CI-stable.
 
 Acceptance criteria:

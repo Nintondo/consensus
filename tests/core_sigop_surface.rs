@@ -28,10 +28,16 @@ fn spend_tx(script_sig: ScriptBuf, witness: Witness) -> Transaction {
     }
 }
 
-fn assert_surface_parity(script_pubkey: &ScriptBuf, tx: &Transaction, flags: u32, expected_ok: bool) {
+fn assert_surface_parity(
+    script_pubkey: &ScriptBuf,
+    tx: &Transaction,
+    flags: u32,
+    expected_ok: bool,
+) {
     let tx_bytes = btc_consensus::serialize(tx);
     let ours = verify_with_flags(script_pubkey.as_bytes(), 1, &tx_bytes, None, 0, flags);
-    let core = bitcoinconsensus::verify_with_flags(script_pubkey.as_bytes(), 1, &tx_bytes, None, 0, flags);
+    let core =
+        bitcoinconsensus::verify_with_flags(script_pubkey.as_bytes(), 1, &tx_bytes, None, 0, flags);
     assert_eq!(
         ours.is_ok(),
         core.is_ok(),

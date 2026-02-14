@@ -452,21 +452,14 @@ impl<'tx, 'script> Interpreter<'tx, 'script> {
         self.exec_data = ExecutionData::default();
         self.script_code_cache = None;
         let txin = &self.tx_ctx.tx().input[self.input_index];
-        self.initialize_sigops(txin.script_sig.as_bytes())?;
         let witness_enabled = self.flags.bits() & VERIFY_WITNESS != 0;
         let p2sh_enabled = self.flags.bits() & VERIFY_P2SH != 0;
         let spent_is_p2sh = is_p2sh(self.spent_output_script);
-        if witness_enabled
-            && spent_is_p2sh
-            && !txin.witness.is_empty()
-            && !is_canonical_single_push(txin.script_sig.as_bytes())
-        {
-            return Err(self.fail(ScriptError::WitnessMalleatedP2SH));
-        }
         if self.flags.bits() & VERIFY_SIGPUSHONLY != 0 && !is_push_only(txin.script_sig.as_bytes())
         {
             return Err(self.fail(ScriptError::SigPushOnly));
         }
+        self.initialize_sigops(txin.script_sig.as_bytes())?;
         if witness_enabled && !txin.witness.is_empty() && !self.has_amount {
             return Err(Error::ERR_AMOUNT_REQUIRED);
         }
@@ -480,6 +473,9 @@ impl<'tx, 'script> Interpreter<'tx, 'script> {
         };
         let spent_script_res = self.run_on_main_stack(self.spent_output_script, SigVersion::Base);
         self.track_script_error(spent_script_res)?;
+        if self.stack.is_empty() || !cast_to_bool(self.stack.last().unwrap()) {
+            return Err(self.fail(ScriptError::EvalFalse));
+        }
         if witness_enabled {
             if let Some((version, program)) = witness_program(self.spent_output_script) {
                 self.had_witness = true;
@@ -538,7 +534,8 @@ impl<'tx, 'script> Interpreter<'tx, 'script> {
         }
 
         if self.flags.bits() & VERIFY_CLEANSTACK != 0 {
-            self.require_clean_stack(&self.stack).map_err(|err| self.fail(err))?;
+            self.require_clean_stack(&self.stack)
+                .map_err(|err| self.fail(err))?;
         }
 
         if witness_enabled && !self.had_witness && !txin.witness.is_empty() {
@@ -575,10 +572,8 @@ impl<'tx, 'script> Interpreter<'tx, 'script> {
     }
 
     fn initialize_sigops(&mut self, script_sig: &[u8]) -> Result<(), Error> {
-        let sigops_sig =
-            count_sigops_bytes(script_sig, false).map_err(|_| self.fail(ScriptError::BadOpcode))?;
-        let sigops_spent = count_sigops_bytes(self.spent_output_script, true)
-            .map_err(|_| self.fail(ScriptError::BadOpcode))?;
+        let sigops_sig = count_sigops_bytes(script_sig, false)?;
+        let sigops_spent = count_sigops_bytes(self.spent_output_script, true)?;
         self.sigops = sigops_sig
             .checked_add(sigops_spent)
             .ok_or(Error::ERR_SCRIPT)?;
@@ -670,11 +665,11 @@ impl<'tx, 'script> Interpreter<'tx, 'script> {
                 let mut len_cursor = cursor;
                 let push_len = read_push_length(bytes, &mut len_cursor, width)
                     .map_err(|err| self.fail(err))?;
-                if push_len > MAX_SCRIPT_ELEMENT_SIZE {
-                    return Err(self.fail(ScriptError::PushSize));
-                }
                 if len_cursor + push_len > script_len {
                     return Err(self.fail(ScriptError::BadOpcode));
+                }
+                if push_len > MAX_SCRIPT_ELEMENT_SIZE {
+                    return Err(self.fail(ScriptError::PushSize));
                 }
                 if should_execute
                     && self.flags.bits() & VERIFY_MINIMALDATA != 0
@@ -1393,9 +1388,6 @@ impl<'tx, 'script> Interpreter<'tx, 'script> {
                 script_code.as_script(),
                 sigversion,
             )?;
-            if !sig_valid && enforce_nullfail && !sigs[sig_index].is_empty() {
-                return Err(self.fail(ScriptError::NullFail));
-            }
             if sig_valid {
                 sig_index += 1;
             }
@@ -1403,7 +1395,7 @@ impl<'tx, 'script> Interpreter<'tx, 'script> {
         }
 
         if !success && enforce_nullfail {
-            let has_non_empty = sigs[sig_index..].iter().any(|sig| !sig.is_empty());
+            let has_non_empty = sigs.iter().any(|sig| !sig.is_empty());
             if has_non_empty {
                 return Err(self.fail(ScriptError::NullFail));
             }
@@ -1498,7 +1490,10 @@ impl<'tx, 'script> Interpreter<'tx, 'script> {
         if (sequence as u32) & SEQUENCE_LOCKTIME_DISABLE_FLAG != 0 {
             return Ok(());
         }
-        if self.tx_ctx.tx().version.0 < 2 {
+        // Core compares transaction version as uint32_t for CSV activation.
+        // This means negative serialized values (e.g. 0xffffffff) are treated
+        // as large versions and satisfy the version gate.
+        if (self.tx_ctx.tx().version.0 as u32) < 2 {
             return Err(ScriptError::UnsatisfiedLockTime);
         }
 
@@ -2440,19 +2435,6 @@ fn find_and_delete(script_bytes: &[u8], pattern: &[u8]) -> (Vec<u8>, usize) {
     }
 }
 
-fn is_canonical_single_push(script_bytes: &[u8]) -> bool {
-    if script_bytes.is_empty() {
-        return false;
-    }
-    let script = Script::from_bytes(script_bytes);
-    let mut instructions = script.instructions();
-    match instructions.next() {
-        Some(Ok(Instruction::PushBytes(_))) => {}
-        _ => return false,
-    }
-    instructions.next().is_none()
-}
-
 fn serialized_witness_size(witness: &Witness) -> Option<i64> {
     let mut total: u64 = compact_size_len(witness.len() as u64);
     for element in witness.iter() {
@@ -2599,11 +2581,15 @@ fn count_sigops(script: &Script, accurate: bool) -> Result<u32, Error> {
     let mut total: u32 = 0;
     let mut last_op: Option<Opcode> = None;
     for instruction in script.instructions() {
-        let instruction = instruction.map_err(|_| Error::ERR_SCRIPT)?;
+        let Ok(instruction) = instruction else {
+            // Match Core's CScript::GetSigOpCount behavior: stop counting when
+            // decoding fails, and return the count accumulated so far.
+            break;
+        };
         match instruction {
             Instruction::Op(opcode) => {
                 match opcode {
-                    OP_CHECKSIG | OP_CHECKSIGVERIFY | OP_CHECKSIGADD => {
+                    OP_CHECKSIG | OP_CHECKSIGVERIFY => {
                         total = total.checked_add(1).ok_or(Error::ERR_SCRIPT)?;
                     }
                     OP_CHECKMULTISIG | OP_CHECKMULTISIGVERIFY => {
@@ -2806,9 +2792,23 @@ mod tests {
     }
 
     #[test]
-    fn sigop_counter_rejects_malformed_pushdata() {
-        let malformed = ScriptBuf::from_bytes(vec![all::OP_PUSHDATA1.to_u8(), 0x01]);
-        assert!(count_sigops_bytes(malformed.as_bytes(), true).is_err());
+    fn sigop_counter_ignores_checksigadd() {
+        let script = Builder::new()
+            .push_opcode(all::OP_CHECKSIG)
+            .push_opcode(all::OP_CHECKSIGADD)
+            .push_opcode(all::OP_CHECKSIGVERIFY)
+            .into_script();
+        assert_eq!(count_sigops_bytes(script.as_bytes(), true).unwrap(), 2);
+    }
+
+    #[test]
+    fn sigop_counter_stops_at_malformed_pushdata() {
+        let malformed = ScriptBuf::from_bytes(vec![
+            all::OP_CHECKSIG.to_u8(),
+            all::OP_PUSHDATA1.to_u8(),
+            0x01,
+        ]);
+        assert_eq!(count_sigops_bytes(malformed.as_bytes(), true).unwrap(), 1);
     }
 
     #[test]
@@ -2833,10 +2833,12 @@ mod tests {
         let spent_script = Builder::new().push_opcode(all::OP_PUSHNUM_1).into_script();
         let spend_context = SpendContext::new(spent_script.as_bytes(), None, 0, true);
         let flags = ScriptFlags::from_bits(VERIFY_WITNESS | VERIFY_P2SH).expect("flags");
-        let mut interpreter = Interpreter::new(&tx_ctx, 0, spend_context, flags).expect("interpreter");
+        let mut interpreter =
+            Interpreter::new(&tx_ctx, 0, spend_context, flags).expect("interpreter");
 
         let program = [0u8; 20];
-        let _ = interpreter.execute_witness_program(0, &program, &tx_ctx.tx().input[0].witness, false);
+        let _ =
+            interpreter.execute_witness_program(0, &program, &tx_ctx.tx().input[0].witness, false);
         assert_eq!(interpreter.sigops, 1);
     }
 
@@ -2868,7 +2870,8 @@ mod tests {
         let spent_script = Builder::new().push_opcode(all::OP_PUSHNUM_1).into_script();
         let spend_context = SpendContext::new(spent_script.as_bytes(), None, 0, true);
         let flags = ScriptFlags::from_bits(VERIFY_WITNESS | VERIFY_P2SH).expect("flags");
-        let mut interpreter = Interpreter::new(&tx_ctx, 0, spend_context, flags).expect("interpreter");
+        let mut interpreter =
+            Interpreter::new(&tx_ctx, 0, spend_context, flags).expect("interpreter");
 
         let _ = interpreter.execute_witness_program(
             0,
@@ -2900,7 +2903,8 @@ mod tests {
         let spent_script = Builder::new().push_opcode(all::OP_PUSHNUM_1).into_script();
         let spend_context = SpendContext::new(spent_script.as_bytes(), None, 0, true);
         let flags = ScriptFlags::from_bits(VERIFY_P2SH).expect("flags");
-        let mut interpreter = Interpreter::new(&tx_ctx, 0, spend_context, flags).expect("interpreter");
+        let mut interpreter =
+            Interpreter::new(&tx_ctx, 0, spend_context, flags).expect("interpreter");
 
         let key1 = PushBytesBuf::try_from(vec![0x02; 33]).unwrap();
         let key2 = PushBytesBuf::try_from(vec![0x03; 33]).unwrap();

@@ -3,18 +3,47 @@ mod script_asm;
 use bitcoin::{consensus as btc_consensus, hex::FromHex, ScriptBuf, Transaction, TxOut, Witness};
 use consensus::{
     verify_with_flags_detailed, Utxo, VERIFY_CHECKLOCKTIMEVERIFY, VERIFY_CHECKSEQUENCEVERIFY,
-    VERIFY_DERSIG, VERIFY_NULLDUMMY, VERIFY_P2SH, VERIFY_TAPROOT, VERIFY_WITNESS,
+    VERIFY_CLEANSTACK, VERIFY_CONST_SCRIPTCODE, VERIFY_DERSIG, VERIFY_DISCOURAGE_OP_SUCCESS,
+    VERIFY_DISCOURAGE_UPGRADABLE_NOPS, VERIFY_DISCOURAGE_UPGRADABLE_PUBKEYTYPE,
+    VERIFY_DISCOURAGE_UPGRADABLE_TAPROOT_VERSION, VERIFY_DISCOURAGE_UPGRADABLE_WITNESS_PROGRAM,
+    VERIFY_LOW_S, VERIFY_MINIMALDATA, VERIFY_MINIMALIF, VERIFY_NULLDUMMY, VERIFY_NULLFAIL,
+    VERIFY_P2SH, VERIFY_SIGPUSHONLY, VERIFY_STRICTENC, VERIFY_TAPROOT, VERIFY_WITNESS,
+    VERIFY_WITNESS_PUBKEYTYPE,
 };
-use serde_json::Value;
 use script_asm::parse_script;
-use std::{
-    collections::BTreeMap,
-    env, fs,
-    path::PathBuf,
-};
+use serde_json::Value;
+use std::{collections::BTreeMap, env, fs, path::PathBuf};
 
 const CORE_TX_VALID: &str = include_str!("data/tx_valid.json");
 const CORE_TX_INVALID: &str = include_str!("data/tx_invalid.json");
+const CONSENSUS_FLAGS_MASK: u32 = VERIFY_P2SH
+    | VERIFY_DERSIG
+    | VERIFY_NULLDUMMY
+    | VERIFY_CHECKLOCKTIMEVERIFY
+    | VERIFY_CHECKSEQUENCEVERIFY
+    | VERIFY_WITNESS
+    | VERIFY_TAPROOT;
+const ALL_TX_VECTOR_FLAGS: u32 = VERIFY_P2SH
+    | VERIFY_STRICTENC
+    | VERIFY_DERSIG
+    | VERIFY_LOW_S
+    | VERIFY_SIGPUSHONLY
+    | VERIFY_MINIMALDATA
+    | VERIFY_NULLDUMMY
+    | VERIFY_DISCOURAGE_UPGRADABLE_NOPS
+    | VERIFY_CLEANSTACK
+    | VERIFY_MINIMALIF
+    | VERIFY_NULLFAIL
+    | VERIFY_CHECKLOCKTIMEVERIFY
+    | VERIFY_CHECKSEQUENCEVERIFY
+    | VERIFY_WITNESS
+    | VERIFY_DISCOURAGE_UPGRADABLE_WITNESS_PROGRAM
+    | VERIFY_WITNESS_PUBKEYTYPE
+    | VERIFY_CONST_SCRIPTCODE
+    | VERIFY_TAPROOT
+    | VERIFY_DISCOURAGE_UPGRADABLE_PUBKEYTYPE
+    | VERIFY_DISCOURAGE_OP_SUCCESS
+    | VERIFY_DISCOURAGE_UPGRADABLE_TAPROOT_VERSION;
 
 fn asset_path() -> PathBuf {
     if let Ok(path) = env::var("SCRIPT_ASSETS_TEST_JSON") {
@@ -62,6 +91,32 @@ fn all_consensus_flags() -> Vec<u32> {
     flags
 }
 
+fn trim_flags(flags: u32) -> u32 {
+    let mut out = flags;
+    // WITNESS requires P2SH.
+    if out & VERIFY_P2SH == 0 {
+        out &= !VERIFY_WITNESS;
+    }
+    // CLEANSTACK requires WITNESS (and transitively P2SH).
+    if out & VERIFY_WITNESS == 0 {
+        out &= !VERIFY_CLEANSTACK;
+    }
+    out
+}
+
+fn fill_flags(flags: u32) -> u32 {
+    let mut out = flags;
+    // CLEANSTACK implies WITNESS.
+    if out & VERIFY_CLEANSTACK != 0 {
+        out |= VERIFY_WITNESS;
+    }
+    // WITNESS implies P2SH.
+    if out & VERIFY_WITNESS != 0 {
+        out |= VERIFY_P2SH;
+    }
+    out
+}
+
 fn parse_flags(raw: &str) -> u32 {
     let mut bits = 0u32;
     for token in raw
@@ -93,8 +148,6 @@ enum TxVectorFlagParse {
 enum TxVectorSkipReason {
     BadTx,
     UnknownToken(String),
-    UnsupportedTokens(Vec<String>),
-    NonCanonicalFlags,
 }
 
 #[derive(Default)]
@@ -104,10 +157,8 @@ struct MonotonicityStats {
     checked_vectors: usize,
     skipped_badtx: usize,
     skipped_unknown: usize,
-    skipped_unsupported: usize,
     skipped_noncanonical: usize,
     unknown_token_counts: BTreeMap<String, usize>,
-    unsupported_token_counts: BTreeMap<String, usize>,
 }
 
 fn parse_tx_vector_flags(raw: &str) -> TxVectorFlagParse {
@@ -116,7 +167,6 @@ fn parse_tx_vector_flags(raw: &str) -> TxVectorFlagParse {
     }
 
     let mut bits = 0u32;
-    let mut unsupported_tokens = Vec::new();
     for token in raw
         .split(',')
         .map(str::trim)
@@ -124,31 +174,27 @@ fn parse_tx_vector_flags(raw: &str) -> TxVectorFlagParse {
     {
         let bit = match token {
             "P2SH" => VERIFY_P2SH,
+            "STRICTENC" => VERIFY_STRICTENC,
             "DERSIG" => VERIFY_DERSIG,
+            "LOW_S" => VERIFY_LOW_S,
+            "SIGPUSHONLY" => VERIFY_SIGPUSHONLY,
+            "MINIMALDATA" => VERIFY_MINIMALDATA,
             "NULLDUMMY" => VERIFY_NULLDUMMY,
+            "DISCOURAGE_UPGRADABLE_NOPS" => VERIFY_DISCOURAGE_UPGRADABLE_NOPS,
+            "CLEANSTACK" => VERIFY_CLEANSTACK,
+            "MINIMALIF" => VERIFY_MINIMALIF,
+            "NULLFAIL" => VERIFY_NULLFAIL,
             "CHECKLOCKTIMEVERIFY" => VERIFY_CHECKLOCKTIMEVERIFY,
             "CHECKSEQUENCEVERIFY" => VERIFY_CHECKSEQUENCEVERIFY,
             "WITNESS" => VERIFY_WITNESS,
+            "DISCOURAGE_UPGRADABLE_WITNESS_PROGRAM" => VERIFY_DISCOURAGE_UPGRADABLE_WITNESS_PROGRAM,
+            "WITNESS_PUBKEYTYPE" => VERIFY_WITNESS_PUBKEYTYPE,
+            "CONST_SCRIPTCODE" => VERIFY_CONST_SCRIPTCODE,
             "TAPROOT" => VERIFY_TAPROOT,
+            "DISCOURAGE_UPGRADABLE_PUBKEYTYPE" => VERIFY_DISCOURAGE_UPGRADABLE_PUBKEYTYPE,
+            "DISCOURAGE_OP_SUCCESS" => VERIFY_DISCOURAGE_OP_SUCCESS,
+            "DISCOURAGE_UPGRADABLE_TAPROOT_VERSION" => VERIFY_DISCOURAGE_UPGRADABLE_TAPROOT_VERSION,
             "BADTX" => return TxVectorFlagParse::Skip(TxVectorSkipReason::BadTx),
-            // Known Core tokens not part of this monotonicity subset.
-            "STRICTENC"
-            | "LOW_S"
-            | "SIGPUSHONLY"
-            | "MINIMALDATA"
-            | "DISCOURAGE_UPGRADABLE_NOPS"
-            | "CLEANSTACK"
-            | "MINIMALIF"
-            | "NULLFAIL"
-            | "CONST_SCRIPTCODE"
-            | "DISCOURAGE_UPGRADABLE_WITNESS_PROGRAM"
-            | "WITNESS_PUBKEYTYPE"
-            | "DISCOURAGE_UPGRADABLE_PUBKEYTYPE"
-            | "DISCOURAGE_OP_SUCCESS"
-            | "DISCOURAGE_UPGRADABLE_TAPROOT_VERSION" => {
-                unsupported_tokens.push(token.to_string());
-                continue;
-            }
             other => {
                 return TxVectorFlagParse::Skip(TxVectorSkipReason::UnknownToken(
                     other.to_string(),
@@ -158,17 +204,6 @@ fn parse_tx_vector_flags(raw: &str) -> TxVectorFlagParse {
         bits |= bit;
     }
 
-    if !unsupported_tokens.is_empty() {
-        return TxVectorFlagParse::Skip(TxVectorSkipReason::UnsupportedTokens(
-            unsupported_tokens,
-        ));
-    }
-
-    if (bits & VERIFY_WITNESS != 0 && bits & VERIFY_P2SH == 0)
-        || (bits & VERIFY_TAPROOT != 0 && bits & VERIFY_WITNESS == 0)
-    {
-        return TxVectorFlagParse::Skip(TxVectorSkipReason::NonCanonicalFlags);
-    }
     TxVectorFlagParse::Parsed(bits)
 }
 
@@ -303,7 +338,7 @@ fn run_core_tx_monotonicity(vectors: &str, expect_success: bool) {
         stats.total_vectors += 1;
 
         let flags_str = arr[2].as_str().expect("flags string");
-        let test_flags = match parse_tx_vector_flags(flags_str) {
+        let parsed_flags = match parse_tx_vector_flags(flags_str) {
             TxVectorFlagParse::Parsed(flags) => {
                 stats.parsed_vectors += 1;
                 flags
@@ -315,17 +350,6 @@ fn run_core_tx_monotonicity(vectors: &str, expect_success: bool) {
             TxVectorFlagParse::Skip(TxVectorSkipReason::UnknownToken(token)) => {
                 stats.skipped_unknown += 1;
                 *stats.unknown_token_counts.entry(token).or_insert(0) += 1;
-                continue;
-            }
-            TxVectorFlagParse::Skip(TxVectorSkipReason::UnsupportedTokens(tokens)) => {
-                stats.skipped_unsupported += 1;
-                for token in tokens {
-                    *stats.unsupported_token_counts.entry(token).or_insert(0) += 1;
-                }
-                continue;
-            }
-            TxVectorFlagParse::Skip(TxVectorSkipReason::NonCanonicalFlags) => {
-                stats.skipped_noncanonical += 1;
                 continue;
             }
         };
@@ -340,29 +364,50 @@ fn run_core_tx_monotonicity(vectors: &str, expect_success: bool) {
             continue;
         }
 
-        for flags in &consensus_flags {
-            if expect_success {
-                if (flags & test_flags) != *flags {
+        if expect_success {
+            // In Core's tx_valid corpus the JSON field carries excluded flags.
+            let included_flags = ALL_TX_VECTOR_FLAGS & !parsed_flags;
+            if fill_flags(included_flags) != included_flags {
+                stats.skipped_noncanonical += 1;
+                continue;
+            }
+            let fixed_non_consensus = included_flags & !CONSENSUS_FLAGS_MASK;
+            let included_consensus = included_flags & CONSENSUS_FLAGS_MASK;
+
+            for consensus_bits in &consensus_flags {
+                if (consensus_bits & included_consensus) != *consensus_bits {
                     continue;
                 }
+                let flags = trim_flags(fixed_non_consensus | *consensus_bits);
                 for input_index in 0..tx.input.len() {
-                    let result = verify_case(&tx, &prevouts, input_index, *flags);
+                    let result = verify_case(&tx, &prevouts, input_index, flags);
                     assert!(
                         result.is_ok(),
-                        "core tx-valid monotonicity mismatch: input={input_index} test_flags={test_flags:#x} flags={flags:#x} tx={tx_hex} result={result:?}"
+                        "core tx-valid monotonicity mismatch: input={input_index} excluded_flags={parsed_flags:#x} flags={flags:#x} tx={tx_hex} result={result:?}"
                     );
                 }
                 checked += 1;
                 stats.checked_vectors += 1;
-            } else {
-                // `tx_invalid.json` does not guarantee monotonic supersets, so this
-                // large-corpus check validates exact-flag failure only.
-                if *flags != test_flags {
+            }
+        } else {
+            // In Core's tx_invalid corpus the JSON field carries direct required
+            // flags. Failure should hold for supersets.
+            let required_flags = fill_flags(parsed_flags);
+            if required_flags != parsed_flags {
+                stats.skipped_noncanonical += 1;
+                continue;
+            }
+            let fixed_non_consensus = required_flags & !CONSENSUS_FLAGS_MASK;
+            let required_consensus = required_flags & CONSENSUS_FLAGS_MASK;
+
+            for consensus_bits in &consensus_flags {
+                if (consensus_bits & required_consensus) != required_consensus {
                     continue;
                 }
+                let flags = fill_flags(fixed_non_consensus | *consensus_bits);
                 let mut any_failed = false;
                 for input_index in 0..tx.input.len() {
-                    let result = verify_case(&tx, &prevouts, input_index, *flags);
+                    let result = verify_case(&tx, &prevouts, input_index, flags);
                     if result.is_err() {
                         any_failed = true;
                         break;
@@ -370,7 +415,7 @@ fn run_core_tx_monotonicity(vectors: &str, expect_success: bool) {
                 }
                 assert!(
                     any_failed,
-                    "core tx-invalid monotonicity mismatch: test_flags={test_flags:#x} flags={flags:#x} tx={tx_hex}"
+                    "core tx-invalid monotonicity mismatch: required_flags={parsed_flags:#x} flags={flags:#x} tx={tx_hex}"
                 );
                 checked += 1;
                 stats.checked_vectors += 1;
@@ -378,22 +423,23 @@ fn run_core_tx_monotonicity(vectors: &str, expect_success: bool) {
         }
     }
 
-    assert!(checked > 0, "core tx monotonicity checks must execute cases");
+    assert!(
+        checked > 0,
+        "core tx monotonicity checks must execute cases"
+    );
     assert!(
         stats.unknown_token_counts.is_empty(),
         "unknown tx-vector flag tokens in monotonicity harness: {:?}",
         stats.unknown_token_counts
     );
     println!(
-        "script_assets coverage (expect_success={}): total={} parsed={} checked={} skipped_badtx={} skipped_unsupported={} skipped_noncanonical={} unsupported_breakdown={:?}",
+        "script_assets coverage (expect_success={}): total={} parsed={} checked={} skipped_badtx={} skipped_noncanonical={}",
         expect_success,
         stats.total_vectors,
         stats.parsed_vectors,
         stats.checked_vectors,
         stats.skipped_badtx,
-        stats.skipped_unsupported,
-        stats.skipped_noncanonical,
-        stats.unsupported_token_counts
+        stats.skipped_noncanonical
     );
 }
 
@@ -410,14 +456,14 @@ fn parse_tx_vector_flags_accepts_none_and_known_tokens() {
 }
 
 #[test]
-fn parse_tx_vector_flags_rejects_unknown_and_unsupported_tokens() {
+fn parse_tx_vector_flags_rejects_unknown_tokens() {
     assert!(matches!(
         parse_tx_vector_flags("P2SH,NO_SUCH_FLAG"),
         TxVectorFlagParse::Skip(TxVectorSkipReason::UnknownToken(_))
     ));
     assert!(matches!(
         parse_tx_vector_flags("P2SH,STRICTENC"),
-        TxVectorFlagParse::Skip(TxVectorSkipReason::UnsupportedTokens(_))
+        TxVectorFlagParse::Parsed(flags) if flags == (VERIFY_P2SH | VERIFY_STRICTENC)
     ));
 }
 

@@ -99,7 +99,10 @@ fn bitcoin_core_bip341_wallet_vectors() {
     let cases = root["keyPathSpending"]
         .as_array()
         .expect("keyPathSpending must be an array");
-    assert!(!cases.is_empty(), "keyPathSpending vectors must not be empty");
+    assert!(
+        !cases.is_empty(),
+        "keyPathSpending vectors must not be empty"
+    );
 
     let secp = Secp256k1::new();
 
@@ -120,7 +123,8 @@ fn bitcoin_core_bip341_wallet_vectors() {
         let hash_sequences = hash_serialized(tx.input.iter().map(|input| &input.sequence));
         let hash_outputs = hash_serialized(tx.output.iter());
         let hash_amounts = hash_spent_amounts_single(&prevouts);
-        let hash_script_pubkeys = hash_serialized(prevouts.iter().map(|txout| &txout.script_pubkey));
+        let hash_script_pubkeys =
+            hash_serialized(prevouts.iter().map(|txout| &txout.script_pubkey));
 
         let intermediary = &case["intermediary"];
         assert_eq!(
@@ -182,9 +186,12 @@ fn bitcoin_core_bip341_wallet_vectors() {
                     .expect("vector hash type must be valid TapSighashType")
             };
 
-            let internal_privkey =
-                Vec::from_hex(given["internalPrivkey"].as_str().expect("internalPrivkey hex"))
-                    .expect("internalPrivkey must be hex");
+            let internal_privkey = Vec::from_hex(
+                given["internalPrivkey"]
+                    .as_str()
+                    .expect("internalPrivkey hex"),
+            )
+            .expect("internalPrivkey must be hex");
             let secret_key = SecretKey::from_slice(&internal_privkey)
                 .expect("internalPrivkey must decode as secp key");
             let keypair = Keypair::from_secret_key(&secp, &secret_key);
@@ -204,7 +211,9 @@ fn bitcoin_core_bip341_wallet_vectors() {
             let tweak = TapTweakHash::from_key_and_tweak(internal_pubkey, merkle_root);
             assert_eq!(
                 tweak.to_string(),
-                intermediary["tweak"].as_str().expect("tweak must be string"),
+                intermediary["tweak"]
+                    .as_str()
+                    .expect("tweak must be string"),
                 "vector #{case_index}/#{input_vector_index}: tweak mismatch"
             );
 
@@ -220,12 +229,15 @@ fn bitcoin_core_bip341_wallet_vectors() {
                 .expect("taproot_signature_hash");
             assert_eq!(
                 sighash.to_string(),
-                intermediary["sigHash"].as_str().expect("sigHash must be string"),
+                intermediary["sigHash"]
+                    .as_str()
+                    .expect("sigHash must be string"),
                 "vector #{case_index}/#{input_vector_index}: sigHash mismatch"
             );
 
             let tweaked_keypair = keypair.tap_tweak(&secp, merkle_root);
-            let signature = secp.sign_schnorr_no_aux_rand(&Message::from(sighash), &tweaked_keypair.to_keypair());
+            let signature = secp
+                .sign_schnorr_no_aux_rand(&Message::from(sighash), &tweaked_keypair.to_keypair());
             let mut signature_bytes = signature.as_ref().to_vec();
             if hash_type != 0 {
                 signature_bytes.push(hash_type);
@@ -250,7 +262,8 @@ fn bitcoin_core_bip341_wallet_vectors() {
 
             let mut spending_tx = tx.clone();
             spending_tx.input[txin_index].script_sig = ScriptBuf::new();
-            spending_tx.input[txin_index].witness = parse_witness(&input_vector["expected"]["witness"]);
+            spending_tx.input[txin_index].witness =
+                parse_witness(&input_vector["expected"]["witness"]);
             let spending_tx_bytes = btc_consensus::serialize(&spending_tx);
 
             let mut script_storage = Vec::with_capacity(prevouts.len());

@@ -596,6 +596,22 @@ mod tests {
     }
 
     #[test]
+    fn verify_sigpushonly_precedes_bad_opcode_for_malformed_pushdata() {
+        let script_sig = ScriptBuf::from_bytes(vec![all::OP_PUSHDATA1.to_u8(), 0x01]);
+        let spent_script = Builder::new().push_opcode(all::OP_PUSHNUM_1).into_script();
+
+        let failure = run_script_with_ctx_flags_detailed(
+            script_sig,
+            spent_script,
+            LockTime::ZERO,
+            Sequence::MAX,
+            VERIFY_SIGPUSHONLY,
+        )
+        .expect_err("sigpushonly must be checked before script execution");
+        assert_eq!(failure.script_error, ScriptError::SigPushOnly);
+    }
+
+    #[test]
     fn verify_discourage_upgradable_nops_flag() {
         let script_sig = Builder::new().push_opcode(all::OP_PUSHNUM_1).into_script();
         let spent_script = Builder::new()
@@ -1001,6 +1017,43 @@ mod tests {
         )
         .expect_err("NULLFAIL should trigger when failing non-empty multisig signatures remain");
         assert_eq!(failure.script_error, ScriptError::NullFail);
+    }
+
+    #[test]
+    fn verify_nullfail_multisig_intermediate_pubkey_mismatch() {
+        let secp = Secp256k1::new();
+        let sk1 = SecretKey::from_slice(&[13u8; 32]).unwrap();
+        let sk2 = SecretKey::from_slice(&[14u8; 32]).unwrap();
+        let pk1 = bitcoin::secp256k1::PublicKey::from_secret_key(&secp, &sk1);
+        let pk2 = bitcoin::secp256k1::PublicKey::from_secret_key(&secp, &sk2);
+
+        // One signature matches only the second pubkey. Core must not trigger
+        // NULLFAIL on the intermediate mismatch against the first pubkey.
+        let spent_script = Builder::new()
+            .push_opcode(all::OP_PUSHNUM_1)
+            .push_slice(PushBytesBuf::try_from(pk1.serialize().to_vec()).unwrap())
+            .push_slice(PushBytesBuf::try_from(pk2.serialize().to_vec()).unwrap())
+            .push_opcode(all::OP_PUSHNUM_2)
+            .push_opcode(all::OP_CHECKMULTISIG)
+            .into_script();
+
+        let mut tx = multisig_test_transaction();
+        let sig2 = sign_input(&secp, &tx, &spent_script, &sk2);
+        tx.input[0].script_sig = Builder::new()
+            .push_opcode(all::OP_PUSHBYTES_0)
+            .push_slice(PushBytesBuf::try_from(sig2).unwrap())
+            .into_script();
+        let tx_bytes = consensus::serialize(&tx);
+
+        verify_with_flags(
+            spent_script.as_bytes(),
+            0,
+            &tx_bytes,
+            None,
+            0,
+            VERIFY_NULLFAIL,
+        )
+        .expect("NULLFAIL must not reject intermediate multisig pubkey mismatches");
     }
 
     #[test]
@@ -1508,7 +1561,8 @@ mod tests {
         let script_sig = Builder::new().into_script();
         let script_pubkey = Builder::new()
             .push_opcode(all::OP_PUSHBYTES_0)
-            .push_slice(PushBytesBuf::try_from(vec![0u8; 5]).unwrap())
+            // Use a non-zero program so EvalFalse does not short-circuit before witness checks.
+            .push_slice(PushBytesBuf::try_from(vec![1u8; 5]).unwrap())
             .into_script();
 
         let failure = run_witness_script_with_ctx(
@@ -1527,7 +1581,8 @@ mod tests {
         let script_sig = Builder::new().into_script();
         let script_pubkey = Builder::new()
             .push_opcode(all::OP_PUSHBYTES_0)
-            .push_slice(PushBytesBuf::try_from(vec![0u8; 32]).unwrap())
+            // Use a non-zero program so EvalFalse does not short-circuit before witness checks.
+            .push_slice(PushBytesBuf::try_from(vec![1u8; 32]).unwrap())
             .into_script();
 
         let failure = run_witness_script_with_ctx(
@@ -1656,8 +1711,8 @@ mod tests {
             .into_script();
         let script_pubkey = ScriptBuf::new_p2sh(&redeem_script.script_hash());
         let script_sig = Builder::new()
-            .push_slice(PushBytesBuf::try_from(redeem_script.as_bytes().to_vec()).unwrap())
             .push_opcode(all::OP_PUSHNUM_1)
+            .push_slice(PushBytesBuf::try_from(redeem_script.as_bytes().to_vec()).unwrap())
             .into_script();
         let witness = Witness::from(vec![inner_script.as_bytes().to_vec()]);
 
@@ -1666,10 +1721,52 @@ mod tests {
             script_pubkey,
             witness,
             Amount::from_sat(50_000),
-            VERIFY_WITNESS,
+            VERIFY_WITNESS | VERIFY_P2SH,
         )
-        .expect_err("non-canonical redeem push fails");
+        .expect_err("non-canonical redeem push fails after P2SH witness detection");
         assert_eq!(failure.script_error, ScriptError::WitnessMalleatedP2SH);
+    }
+
+    #[test]
+    fn verify_p2sh_non_witness_program_with_witness_is_unexpected() {
+        let redeem_script = Builder::new().push_opcode(all::OP_PUSHNUM_1).into_script();
+        let script_pubkey = ScriptBuf::new_p2sh(&redeem_script.script_hash());
+        let script_sig = Builder::new()
+            .push_opcode(all::OP_PUSHNUM_1)
+            .push_slice(PushBytesBuf::try_from(redeem_script.as_bytes().to_vec()).unwrap())
+            .into_script();
+        let witness = Witness::from(vec![vec![0x01]]);
+
+        let failure = run_witness_script_with_ctx(
+            script_sig,
+            script_pubkey,
+            witness,
+            Amount::from_sat(50_000),
+            VERIFY_WITNESS | VERIFY_P2SH,
+        )
+        .expect_err("non-witness P2SH spends must report unexpected witness data");
+        assert_eq!(failure.script_error, ScriptError::WitnessUnexpected);
+    }
+
+    #[test]
+    fn verify_unknown_witness_program_does_not_bypass_eval_false() {
+        // Mirrors Core tx_invalid case:
+        // unknown witness versions that leave a false stack value are still
+        // invalid because EvalFalse is checked before witness processing.
+        let script_pubkey = Builder::new()
+            .push_opcode(all::OP_PUSHNUM_16)
+            .push_slice(PushBytesBuf::try_from(vec![0x00, 0x00]).unwrap())
+            .into_script();
+
+        let failure = run_witness_script_with_ctx(
+            Builder::new().into_script(),
+            script_pubkey,
+            Witness::from(vec![vec![0x01]]),
+            Amount::from_sat(2_000),
+            VERIFY_P2SH | VERIFY_WITNESS,
+        )
+        .expect_err("EvalFalse must be enforced before unknown-version witness handling");
+        assert_eq!(failure.script_error, ScriptError::EvalFalse);
     }
 
     #[test]
@@ -2781,6 +2878,21 @@ mod tests {
             VERIFY_CHECKSEQUENCEVERIFY,
         )
         .expect("csv should pass once transaction version is >= 2");
+
+        run_script_with_ctx_version_flags_detailed(
+            Version(-1),
+            Builder::new().into_script(),
+            Builder::new()
+                .push_int(1)
+                .push_opcode(all::OP_CSV)
+                .push_opcode(all::OP_DROP)
+                .push_opcode(all::OP_PUSHNUM_1)
+                .into_script(),
+            LockTime::ZERO,
+            Sequence(1),
+            VERIFY_CHECKSEQUENCEVERIFY,
+        )
+        .expect("csv version gate uses uint32 semantics (negative values are >= 2)");
     }
 
     #[test]
@@ -3020,6 +3132,25 @@ mod tests {
                 VERIFY_NONE,
             )
             .expect_err("truncated pushdata opcode should fail");
+            assert_eq!(failure.script_error, ScriptError::BadOpcode);
+        }
+    }
+
+    #[test]
+    fn truncated_oversized_pushdata_reports_bad_opcode_before_pushsize() {
+        let spent_script = Builder::new().push_opcode(all::OP_PUSHNUM_1).into_script();
+        for truncated in [
+            vec![all::OP_PUSHDATA2.to_u8(), 0x09, 0x02],
+            vec![all::OP_PUSHDATA4.to_u8(), 0x09, 0x02, 0x00, 0x00],
+        ] {
+            let failure = run_script_with_ctx_flags_detailed(
+                ScriptBuf::from_bytes(truncated),
+                spent_script.clone(),
+                LockTime::ZERO,
+                Sequence::MAX,
+                VERIFY_NONE,
+            )
+            .expect_err("truncated oversized pushdata must fail as bad opcode");
             assert_eq!(failure.script_error, ScriptError::BadOpcode);
         }
     }

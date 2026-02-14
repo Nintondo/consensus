@@ -5,7 +5,12 @@ mod script_asm;
 use bitcoin::{consensus as btc_consensus, hex::FromHex, OutPoint, ScriptBuf, Transaction, Txid};
 use consensus::{
     verify_with_flags_detailed, Utxo, VERIFY_CHECKLOCKTIMEVERIFY, VERIFY_CHECKSEQUENCEVERIFY,
-    VERIFY_DERSIG, VERIFY_NULLDUMMY, VERIFY_P2SH, VERIFY_TAPROOT, VERIFY_WITNESS,
+    VERIFY_CLEANSTACK, VERIFY_CONST_SCRIPTCODE, VERIFY_DERSIG, VERIFY_DISCOURAGE_OP_SUCCESS,
+    VERIFY_DISCOURAGE_UPGRADABLE_NOPS, VERIFY_DISCOURAGE_UPGRADABLE_PUBKEYTYPE,
+    VERIFY_DISCOURAGE_UPGRADABLE_TAPROOT_VERSION, VERIFY_DISCOURAGE_UPGRADABLE_WITNESS_PROGRAM,
+    VERIFY_LOW_S, VERIFY_MINIMALDATA, VERIFY_MINIMALIF, VERIFY_NULLDUMMY, VERIFY_NULLFAIL,
+    VERIFY_P2SH, VERIFY_SIGPUSHONLY, VERIFY_STRICTENC, VERIFY_TAPROOT, VERIFY_WITNESS,
+    VERIFY_WITNESS_PUBKEYTYPE,
 };
 use script_asm::parse_script;
 use serde_json::Value;
@@ -24,6 +29,27 @@ const DIFF_SUPPORTED_FLAGS: u32 = VERIFY_P2SH
     | VERIFY_CHECKSEQUENCEVERIFY
     | VERIFY_WITNESS
     | VERIFY_TAPROOT;
+const ALL_TX_VECTOR_FLAGS: u32 = VERIFY_P2SH
+    | VERIFY_STRICTENC
+    | VERIFY_DERSIG
+    | VERIFY_LOW_S
+    | VERIFY_SIGPUSHONLY
+    | VERIFY_MINIMALDATA
+    | VERIFY_NULLDUMMY
+    | VERIFY_DISCOURAGE_UPGRADABLE_NOPS
+    | VERIFY_CLEANSTACK
+    | VERIFY_MINIMALIF
+    | VERIFY_NULLFAIL
+    | VERIFY_CHECKLOCKTIMEVERIFY
+    | VERIFY_CHECKSEQUENCEVERIFY
+    | VERIFY_WITNESS
+    | VERIFY_DISCOURAGE_UPGRADABLE_WITNESS_PROGRAM
+    | VERIFY_WITNESS_PUBKEYTYPE
+    | VERIFY_CONST_SCRIPTCODE
+    | VERIFY_TAPROOT
+    | VERIFY_DISCOURAGE_UPGRADABLE_PUBKEYTYPE
+    | VERIFY_DISCOURAGE_OP_SUCCESS
+    | VERIFY_DISCOURAGE_UPGRADABLE_TAPROOT_VERSION;
 
 #[derive(Clone)]
 struct PrevoutData {
@@ -34,17 +60,14 @@ struct PrevoutData {
 #[derive(Debug)]
 enum FlagParseError {
     UnknownToken(String),
-    UnsupportedTokens(Vec<String>),
 }
 
 #[derive(Default)]
 struct DiffCoverageStats {
     total_vectors: usize,
-    executed_vectors: usize,
+    checked_vectors: usize,
+    differential_vectors: usize,
     skipped_badtx: usize,
-    skipped_unsupported: usize,
-    skipped_noncanonical: usize,
-    unsupported_token_counts: BTreeMap<String, usize>,
     unknown_token_counts: BTreeMap<String, usize>,
 }
 
@@ -54,7 +77,6 @@ fn parse_flags(raw: &str) -> Result<u32, FlagParseError> {
     }
 
     let mut bits = 0u32;
-    let mut unsupported_tokens = Vec::new();
     for token in raw
         .split(',')
         .map(str::trim)
@@ -62,41 +84,45 @@ fn parse_flags(raw: &str) -> Result<u32, FlagParseError> {
     {
         let bit = match token {
             "P2SH" => VERIFY_P2SH,
+            "STRICTENC" => VERIFY_STRICTENC,
             "DERSIG" => VERIFY_DERSIG,
+            "LOW_S" => VERIFY_LOW_S,
+            "SIGPUSHONLY" => VERIFY_SIGPUSHONLY,
+            "MINIMALDATA" => VERIFY_MINIMALDATA,
             "NULLDUMMY" => VERIFY_NULLDUMMY,
+            "DISCOURAGE_UPGRADABLE_NOPS" => VERIFY_DISCOURAGE_UPGRADABLE_NOPS,
+            "CLEANSTACK" => VERIFY_CLEANSTACK,
+            "MINIMALIF" => VERIFY_MINIMALIF,
+            "NULLFAIL" => VERIFY_NULLFAIL,
             "CHECKLOCKTIMEVERIFY" => VERIFY_CHECKLOCKTIMEVERIFY,
             "CHECKSEQUENCEVERIFY" => VERIFY_CHECKSEQUENCEVERIFY,
             "WITNESS" => VERIFY_WITNESS,
+            "DISCOURAGE_UPGRADABLE_WITNESS_PROGRAM" => VERIFY_DISCOURAGE_UPGRADABLE_WITNESS_PROGRAM,
+            "WITNESS_PUBKEYTYPE" => VERIFY_WITNESS_PUBKEYTYPE,
+            "CONST_SCRIPTCODE" => VERIFY_CONST_SCRIPTCODE,
             "TAPROOT" => VERIFY_TAPROOT,
-            // Known Core tokens that this differential does not support because
-            // they are outside the libbitcoinconsensus-exposed flag subset.
-            "STRICTENC"
-            | "LOW_S"
-            | "SIGPUSHONLY"
-            | "MINIMALDATA"
-            | "DISCOURAGE_UPGRADABLE_NOPS"
-            | "CLEANSTACK"
-            | "MINIMALIF"
-            | "NULLFAIL"
-            | "CONST_SCRIPTCODE"
-            | "DISCOURAGE_UPGRADABLE_WITNESS_PROGRAM"
-            | "WITNESS_PUBKEYTYPE"
-            | "DISCOURAGE_UPGRADABLE_PUBKEYTYPE"
-            | "DISCOURAGE_OP_SUCCESS"
-            | "DISCOURAGE_UPGRADABLE_TAPROOT_VERSION" => {
-                unsupported_tokens.push(token.to_string());
-                continue;
-            }
+            "DISCOURAGE_UPGRADABLE_PUBKEYTYPE" => VERIFY_DISCOURAGE_UPGRADABLE_PUBKEYTYPE,
+            "DISCOURAGE_OP_SUCCESS" => VERIFY_DISCOURAGE_OP_SUCCESS,
+            "DISCOURAGE_UPGRADABLE_TAPROOT_VERSION" => VERIFY_DISCOURAGE_UPGRADABLE_TAPROOT_VERSION,
             other => return Err(FlagParseError::UnknownToken(other.to_string())),
         };
         bits |= bit;
     }
 
-    if !unsupported_tokens.is_empty() {
-        return Err(FlagParseError::UnsupportedTokens(unsupported_tokens));
-    }
-
     Ok(bits)
+}
+
+fn fill_flags(flags: u32) -> u32 {
+    let mut out = flags;
+    // CLEANSTACK implies WITNESS.
+    if out & VERIFY_CLEANSTACK != 0 {
+        out |= VERIFY_WITNESS;
+    }
+    // WITNESS implies P2SH.
+    if out & VERIFY_WITNESS != 0 {
+        out |= VERIFY_P2SH;
+    }
+    out
 }
 
 fn parse_prevouts(raw_inputs: &[Value]) -> HashMap<OutPoint, PrevoutData> {
@@ -205,7 +231,73 @@ fn run_case_differential(
     }
 }
 
-fn run_tx_vector_file(vectors: &str) {
+fn run_case_local_expectation(
+    tx: &Transaction,
+    prevouts: &HashMap<OutPoint, PrevoutData>,
+    flags: u32,
+    label: &str,
+    expect_success: bool,
+) {
+    let tx_bytes = btc_consensus::serialize(tx);
+    let mut ordered_prevouts = Vec::with_capacity(tx.input.len());
+    let mut script_storage = Vec::with_capacity(tx.input.len());
+    for txin in &tx.input {
+        let prevout = prevouts
+            .get(&txin.previous_output)
+            .unwrap_or_else(|| {
+                panic!(
+                    "missing prevout {:?} for case {label}",
+                    txin.previous_output
+                )
+            })
+            .clone();
+        script_storage.push(prevout.script_pubkey.as_bytes().to_vec());
+        ordered_prevouts.push(prevout);
+    }
+
+    let ours_utxos: Vec<Utxo> = ordered_prevouts
+        .iter()
+        .zip(script_storage.iter())
+        .map(|(prevout, script_bytes)| Utxo {
+            script_pubkey: script_bytes.as_ptr(),
+            script_pubkey_len: script_bytes.len() as u32,
+            value: prevout.amount_sat as i64,
+        })
+        .collect();
+    let ours_spent = if flags & VERIFY_TAPROOT != 0 {
+        Some(ours_utxos.as_slice())
+    } else {
+        None
+    };
+
+    let mut any_failed = false;
+    for (index, prevout) in ordered_prevouts.iter().enumerate() {
+        let ours = verify_with_flags_detailed(
+            prevout.script_pubkey.as_bytes(),
+            prevout.amount_sat,
+            &tx_bytes,
+            ours_spent,
+            index,
+            flags,
+        );
+        if expect_success {
+            assert!(
+                ours.is_ok(),
+                "tx vector expected success for {label}: input={index} flags={flags:#x} ours={ours:?}"
+            );
+        } else if ours.is_err() {
+            any_failed = true;
+        }
+    }
+    if !expect_success {
+        assert!(
+            any_failed,
+            "tx vector expected failure for {label}: flags={flags:#x}"
+        );
+    }
+}
+
+fn run_tx_vector_file(vectors: &str, expect_success: bool) {
     let tests: Vec<Value> = serde_json::from_str(vectors).expect("tx vectors parse");
     let mut stats = DiffCoverageStats::default();
 
@@ -227,23 +319,26 @@ fn run_tx_vector_file(vectors: &str) {
             stats.skipped_badtx += 1;
             continue;
         }
-        let direct_flags = match parse_flags(flags_str) {
+        let parsed_flags = match parse_flags(flags_str) {
             Ok(bits) => bits,
-            Err(FlagParseError::UnsupportedTokens(tokens)) => {
-                stats.skipped_unsupported += 1;
-                for token in tokens {
-                    *stats.unsupported_token_counts.entry(token).or_insert(0) += 1;
-                }
-                continue;
-            }
             Err(FlagParseError::UnknownToken(token)) => {
                 *stats.unknown_token_counts.entry(token).or_insert(0) += 1;
                 continue;
             }
         };
-        let canonical = |flags: u32| {
-            (flags & VERIFY_WITNESS == 0 || flags & VERIFY_P2SH != 0)
-                && (flags & VERIFY_TAPROOT == 0 || flags & VERIFY_WITNESS != 0)
+        let direct_flags = if expect_success {
+            // In tx_valid, the JSON field is the excluded flag mask.
+            let included = ALL_TX_VECTOR_FLAGS & !parsed_flags;
+            if fill_flags(included) != included {
+                continue;
+            }
+            included
+        } else {
+            // In tx_invalid, the JSON field is the direct required flag mask.
+            if fill_flags(parsed_flags) != parsed_flags {
+                continue;
+            }
+            parsed_flags
         };
 
         let prevouts = parse_prevouts(arr[0].as_array().expect("inputs array"));
@@ -251,49 +346,47 @@ fn run_tx_vector_file(vectors: &str) {
         let tx_bytes = Vec::from_hex(tx_hex).expect("valid tx hex");
         let tx: Transaction = btc_consensus::deserialize(&tx_bytes).expect("deserializable tx");
 
-        if !canonical(direct_flags) {
-            stats.skipped_noncanonical += 1;
-            continue;
-        }
+        run_case_local_expectation(&tx, &prevouts, direct_flags, tx_hex, expect_success);
+        stats.checked_vectors += 1;
 
-        debug_assert_eq!(direct_flags & !DIFF_SUPPORTED_FLAGS, 0);
-        run_case_differential(&tx, &prevouts, direct_flags, tx_hex);
-        stats.executed_vectors += 1;
+        if direct_flags & !DIFF_SUPPORTED_FLAGS == 0 {
+            run_case_differential(&tx, &prevouts, direct_flags, tx_hex);
+            stats.differential_vectors += 1;
+        }
     }
 
     assert!(
-        stats.executed_vectors > 0,
-        "core tx differential executed no vectors (total={} badtx={} unsupported={} noncanonical={})",
+        stats.checked_vectors > 0,
+        "core tx vectors executed no checks (total={} badtx={})",
         stats.total_vectors,
-        stats.skipped_badtx,
-        stats.skipped_unsupported,
-        stats.skipped_noncanonical
+        stats.skipped_badtx
     );
     assert!(
         stats.unknown_token_counts.is_empty(),
         "unknown tx-vector flag tokens encountered: {:?}",
         stats.unknown_token_counts
     );
+    if !expect_success {
+        assert!(
+            stats.differential_vectors > 0,
+            "core tx vectors executed no libbitcoinconsensus differential checks"
+        );
+    }
 
     println!(
-        "core_tx_vectors coverage: total={} executed={} skipped_badtx={} skipped_unsupported={} skipped_noncanonical={} unsupported_breakdown={:?}",
-        stats.total_vectors,
-        stats.executed_vectors,
-        stats.skipped_badtx,
-        stats.skipped_unsupported,
-        stats.skipped_noncanonical,
-        stats.unsupported_token_counts
+        "core_tx_vectors coverage: total={} checked={} differential={} skipped_badtx={}",
+        stats.total_vectors, stats.checked_vectors, stats.differential_vectors, stats.skipped_badtx,
     );
 }
 
 #[test]
 fn core_tx_valid_differential() {
-    run_tx_vector_file(CORE_TX_VALID);
+    run_tx_vector_file(CORE_TX_VALID, true);
 }
 
 #[test]
 fn core_tx_invalid_differential() {
-    run_tx_vector_file(CORE_TX_INVALID);
+    run_tx_vector_file(CORE_TX_INVALID, false);
 }
 
 #[test]
@@ -306,13 +399,13 @@ fn parse_flags_accepts_none_and_known_tokens() {
 }
 
 #[test]
-fn parse_flags_rejects_unknown_and_unsupported_tokens() {
+fn parse_flags_rejects_unknown_tokens() {
     assert!(matches!(
         parse_flags("P2SH,NO_SUCH_FLAG"),
         Err(FlagParseError::UnknownToken(_))
     ));
-    assert!(matches!(
-        parse_flags("P2SH,STRICTENC"),
-        Err(FlagParseError::UnsupportedTokens(_))
-    ));
+    assert_eq!(
+        parse_flags("P2SH,STRICTENC").expect("policy token parses"),
+        VERIFY_P2SH | VERIFY_STRICTENC
+    );
 }
