@@ -680,10 +680,7 @@ impl<'tx, 'script> Interpreter<'tx, 'script> {
                     return Err(self.fail(ScriptError::MinimalData));
                 }
                 if should_execute {
-                    self.push_element(
-                        stack,
-                        bytes[len_cursor..len_cursor + push_len].to_vec(),
-                    )?;
+                    self.push_element(stack, bytes[len_cursor..len_cursor + push_len].to_vec())?;
                 }
                 cursor = len_cursor + push_len;
             } else {
@@ -727,8 +724,14 @@ impl<'tx, 'script> Interpreter<'tx, 'script> {
                             self.exec_data.code_separator_pos = Some(position as u32);
                         }
                     } else {
-                        let opcode_res =
-                            self.execute_opcode(stack, &mut altstack, op, &script, code_separator, sigversion);
+                        let opcode_res = self.execute_opcode(
+                            stack,
+                            &mut altstack,
+                            op,
+                            &script,
+                            code_separator,
+                            sigversion,
+                        );
                         self.track_script_error(opcode_res)?;
                     }
                 }
