@@ -176,10 +176,6 @@ impl ScriptFlags {
     pub fn bits(self) -> u32 {
         self.0
     }
-
-    pub fn requires_spent_outputs(self) -> bool {
-        self.0 & VERIFY_TAPROOT != 0
-    }
 }
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -410,10 +406,6 @@ impl<'tx, 'script> Interpreter<'tx, 'script> {
         spend: SpendContext<'script>,
         flags: ScriptFlags,
     ) -> Result<Self, Error> {
-        if flags.requires_spent_outputs() && spend.spent_outputs.is_none() {
-            return Err(Error::ERR_SPENT_OUTPUTS_REQUIRED);
-        }
-
         let SpendContext {
             script_pubkey,
             spent_outputs,
@@ -443,10 +435,6 @@ impl<'tx, 'script> Interpreter<'tx, 'script> {
     }
 
     pub fn verify(&mut self) -> Result<(), Error> {
-        if self.flags.requires_spent_outputs() && self.spent_outputs.is_none() {
-            return Err(Error::ERR_SPENT_OUTPUTS_REQUIRED);
-        }
-
         self.last_error = ScriptError::Ok;
         self.had_witness = false;
         self.exec_data = ExecutionData::default();
@@ -1946,8 +1934,12 @@ impl<'tx, 'script> Interpreter<'tx, 'script> {
         sig_bytes: &[u8],
         pubkey_bytes: &[u8],
     ) -> Result<bool, Error> {
-        let has_signature = !sig_bytes.is_empty();
-        if has_signature {
+        // Match Core's EvalChecksigTapscript flow:
+        // - success starts as !sig.empty()
+        // - non-empty signatures are charged before pubkey-type branching
+        // - for 32-byte keys, non-empty invalid Schnorr signatures abort script
+        let success = !sig_bytes.is_empty();
+        if success {
             // Core charges validation weight for every non-empty signature before
             // branching on pubkey type, including upgradable key versions.
             self.consume_tapscript_sigop()?;
@@ -1961,16 +1953,16 @@ impl<'tx, 'script> Interpreter<'tx, 'script> {
             if self.flags.bits() & VERIFY_DISCOURAGE_UPGRADABLE_PUBKEYTYPE != 0 {
                 return Err(self.fail(ScriptError::DiscourageUpgradablePubkeyType));
             }
-            return Ok(has_signature);
+            return Ok(success);
         }
 
-        if !has_signature {
+        if !success {
             return Ok(false);
         }
 
-        let Some(parts) = self.parse_taproot_signature(sig_bytes)? else {
-            return Ok(false);
-        };
+        let parts = self
+            .parse_taproot_signature(sig_bytes)?
+            .ok_or_else(|| self.fail(ScriptError::SchnorrSigSize))?;
         let pubkey = XOnlyPublicKey::from_slice(pubkey_bytes)
             .map_err(|_| self.fail(ScriptError::PubkeyType))?;
         let tapleaf_hash = self
@@ -1978,12 +1970,18 @@ impl<'tx, 'script> Interpreter<'tx, 'script> {
             .tapleaf_hash
             .ok_or_else(|| self.fail(ScriptError::WitnessProgramMismatch))?;
         let code_separator = self.exec_data.code_separator_pos.unwrap_or(u32::MAX);
-        self.verify_taproot_signature_common(
+        let verified = self.verify_taproot_signature_common(
             &parts.signature,
             parts.sighash_type,
             &pubkey,
             Some((tapleaf_hash, code_separator)),
-        )
+        )?;
+
+        if !verified {
+            return Err(self.fail(ScriptError::SchnorrSig));
+        }
+
+        Ok(true)
     }
 
     fn verify_taproot_signature_common(
@@ -1998,10 +1996,9 @@ impl<'tx, 'script> Interpreter<'tx, 'script> {
             return Err(self.fail(ScriptError::SchnorrSigHashType));
         }
 
-        let spent_outputs = self
-            .spent_outputs
-            .as_ref()
-            .ok_or(Error::ERR_SPENT_OUTPUTS_REQUIRED)?;
+        let Some(spent_outputs) = self.spent_outputs.as_ref() else {
+            return Err(self.fail(ScriptError::SchnorrSigHashType));
+        };
         let prevouts = Prevouts::All(spent_outputs.txouts());
         let annex = self.exec_data.annex.clone();
 
@@ -2712,7 +2709,11 @@ fn is_compressed_pubkey(pubkey: &[u8]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{VERIFY_DERSIG, VERIFY_P2SH, VERIFY_SIGPUSHONLY, VERIFY_TAPROOT, VERIFY_WITNESS};
+    use crate::{
+        verify_with_flags_detailed, Utxo, VERIFY_CHECKLOCKTIMEVERIFY, VERIFY_CHECKSEQUENCEVERIFY,
+        VERIFY_DERSIG, VERIFY_NULLDUMMY, VERIFY_P2SH, VERIFY_SIGPUSHONLY, VERIFY_TAPROOT,
+        VERIFY_WITNESS,
+    };
     use bitcoin::{
         blockdata::script::{Builder, PushBytesBuf},
         consensus,
@@ -2727,12 +2728,6 @@ mod tests {
     fn rejects_unknown_flags() {
         let invalid_bit = 1 << 31;
         ScriptFlags::from_bits(invalid_bit).expect_err("invalid flag");
-    }
-
-    #[test]
-    fn requires_spent_outputs_for_taproot() {
-        let flags = ScriptFlags::from_bits(VERIFY_TAPROOT).unwrap();
-        assert!(flags.requires_spent_outputs());
     }
 
     #[test]
@@ -2752,7 +2747,6 @@ mod tests {
     fn taproot_flag_does_not_imply_witness_helpers() {
         let flags = ScriptFlags::from_bits(VERIFY_TAPROOT).unwrap();
         assert_eq!(flags.bits(), VERIFY_TAPROOT);
-        assert!(flags.requires_spent_outputs());
     }
 
     #[test]
@@ -3166,5 +3160,58 @@ mod tests {
         let witness_v0 = Interpreter::materialize_script_code(script.as_script(), 0, false)
             .expect("witness v0 script code materializes");
         assert_eq!(witness_v0.as_bytes(), script.as_bytes());
+    }
+
+    #[test]
+    fn tapscript_non_empty_invalid_signature_aborts_checksigadd() {
+        const TX_HEX: &str = "01000000018e3085dff8388133cee868fc8b54f7c10555ec48d13f732f7c739211a3b0aada5c010000003eb29dac019a930c0000000000160014dd510dc8170df8be8f2c9059555d240eff70c0ac9e000000";
+        const PREVOUT_HEX: &str =
+            "29cd32000000000022512093a6395e6eec9746fac0e18e6881250256fb7a8f64a5cd3a1e7e3583dee14c3e";
+        const TAPSCRIPT_HEX: &str =
+            "5220a9d4f17d94d86e68a48aaa51b1c389c73422fc855bd29c1aa600c12ecce8fc01ba5287";
+        const CONTROL_BLOCK_HEX: &str =
+            "c0ad831dbc6df8d392b2f9a27b42aba947a15ac87e8f1400979e2c068f61069d441d0acb57cc1743c2e58f3c32307be1cfd56123f0a72ada3f089305ca7e663ae6ccb452062f91892c5515dee824efb9efbe80fe7717c2ec0082c7a15e4ffb3fd0";
+        const INVALID_SIG_HEX: &str =
+            "9cd3b31fced5fa92eeb497d0efbbf31a1dfb560a43c46b5ffbe708390c568d224e2534b32fbb1ab5d70ba248087a4ea4ace8f445b8b4fd47996e843d41bb6f35";
+        const FLAGS: u32 = VERIFY_P2SH
+            | VERIFY_DERSIG
+            | VERIFY_CHECKLOCKTIMEVERIFY
+            | VERIFY_CHECKSEQUENCEVERIFY
+            | VERIFY_WITNESS
+            | VERIFY_NULLDUMMY
+            | VERIFY_TAPROOT;
+
+        let mut tx: Transaction =
+            consensus::deserialize(&Vec::from_hex(TX_HEX).expect("tx hex")).expect("tx decode");
+        tx.input[0].script_sig = ScriptBuf::new();
+        let prevout: TxOut = consensus::deserialize(&Vec::from_hex(PREVOUT_HEX).expect("prevout"))
+            .expect("prevout decode");
+
+        let script = Vec::from_hex(TAPSCRIPT_HEX).expect("tapscript hex");
+        let control = Vec::from_hex(CONTROL_BLOCK_HEX).expect("control hex");
+        let script_pubkey_storage = vec![prevout.script_pubkey.as_bytes().to_vec()];
+        let utxos = vec![Utxo {
+            script_pubkey: script_pubkey_storage[0].as_ptr(),
+            script_pubkey_len: script_pubkey_storage[0].len() as u32,
+            value: prevout.value.to_sat() as i64,
+        }];
+
+        let mut run_with_sig = |sig: Vec<u8>| {
+            tx.input[0].witness = Witness::from_slice(&[sig, script.clone(), control.clone()]);
+            let tx_bytes = consensus::serialize(&tx);
+            verify_with_flags_detailed(
+                prevout.script_pubkey.as_bytes(),
+                prevout.value.to_sat(),
+                &tx_bytes,
+                Some(&utxos),
+                0,
+                FLAGS,
+            )
+        };
+
+        run_with_sig(Vec::new()).expect("empty signature should leave CHECKSIGADD false and pass");
+        let failure = run_with_sig(Vec::from_hex(INVALID_SIG_HEX).expect("invalid sig"))
+            .expect_err("non-empty invalid Schnorr signature must abort tapscript checksigadd");
+        assert_eq!(failure.script_error, ScriptError::SchnorrSig);
     }
 }

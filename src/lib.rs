@@ -242,7 +242,6 @@ fn perform_verification(
             error: err,
             script_error: ScriptError::Ok,
         })?;
-    let mut derived_amount: Option<u64> = None;
     if let Some(set) = spent_outputs.as_ref() {
         let prevout = &set.txouts()[input_index];
         if prevout.script_pubkey.as_bytes() != spent_output_script {
@@ -251,11 +250,9 @@ fn perform_verification(
                 script_error: ScriptError::Ok,
             });
         }
-        derived_amount = Some(prevout.value.to_sat());
     }
     let explicit_amount_known = true;
-    let amount = derived_amount.unwrap_or(amount);
-    let has_amount = derived_amount.is_some() || explicit_amount_known;
+    let has_amount = explicit_amount_known;
     let spend_context = SpendContext::new(spent_output_script, spent_outputs, amount, has_amount);
     let mut interpreter =
         Interpreter::new(&tx_ctx, input_index, spend_context, flags).map_err(|err| {
@@ -1829,7 +1826,7 @@ mod tests {
     }
 
     #[test]
-    fn witness_amount_inferred_from_spent_outputs() {
+    fn witness_uses_explicit_amount_even_with_spent_outputs() {
         let secp = Secp256k1::new();
         let sk = SecretKey::from_slice(&[13u8; 32]).unwrap();
         let pk = bitcoin::secp256k1::PublicKey::from_secret_key(&secp, &sk);
@@ -1874,22 +1871,32 @@ mod tests {
         let utxos = [utxo];
         verify_with_flags(
             spent_script.as_bytes(),
+            value.to_sat(),
+            &tx_bytes,
+            Some(&utxos),
+            0,
+            VERIFY_WITNESS,
+        )
+        .expect("explicit amount remains authoritative");
+        let failure = verify_with_flags_detailed(
+            spent_script.as_bytes(),
             0,
             &tx_bytes,
             Some(&utxos),
             0,
             VERIFY_WITNESS,
         )
-        .expect("prevout amount inferred from spent outputs");
+        .expect_err("wrong explicit amount should fail even if prevouts include the right value");
+        assert_eq!(failure.script_error, ScriptError::EvalFalse);
         drop(storage);
     }
 
     #[test]
-    fn taproot_flag_requires_prevouts() {
+    fn taproot_flag_without_prevouts_does_not_fail_non_taproot_path() {
         let spent_script = Builder::new().push_opcode(all::OP_PUSHNUM_1).into_script();
         let tx = multisig_test_transaction();
         let tx_bytes = consensus::serialize(&tx);
-        let err = verify_with_flags(
+        verify_with_flags(
             spent_script.as_bytes(),
             0,
             &tx_bytes,
@@ -1897,8 +1904,76 @@ mod tests {
             0,
             VERIFY_TAPROOT,
         )
-        .expect_err("taproot without prevouts should fail");
-        assert_eq!(err, Error::ERR_SPENT_OUTPUTS_REQUIRED);
+        .expect("non-taproot execution should not require prevouts");
+    }
+
+    #[test]
+    fn taproot_flag_without_prevouts_does_not_fail_non_taproot_witness_path() {
+        let program = PushBytesBuf::try_from(vec![0x42; 32]).unwrap();
+        let spent_script = Builder::new()
+            .push_opcode(all::OP_PUSHNUM_2)
+            .push_slice(program)
+            .into_script();
+        let tx = Transaction {
+            version: Version(2),
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint::default(),
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence::MAX,
+                witness: Witness::from(vec![vec![0x01]]),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(0),
+                script_pubkey: ScriptBuf::new(),
+            }],
+        };
+        let tx_bytes = consensus::serialize(&tx);
+        verify_with_flags(
+            spent_script.as_bytes(),
+            0,
+            &tx_bytes,
+            None,
+            0,
+            VERIFY_P2SH | VERIFY_WITNESS | VERIFY_TAPROOT,
+        )
+        .expect("non-taproot witness program should not require prevouts");
+    }
+
+    #[test]
+    fn taproot_keypath_without_prevouts_fails_in_signature_hash_path() {
+        let secp = Secp256k1::new();
+        let keypair = Keypair::from_seckey_slice(&secp, &[35u8; 32]).unwrap();
+        let (xonly, _) = keypair.x_only_public_key();
+        let spent_script = Builder::new()
+            .push_opcode(all::OP_PUSHNUM_1)
+            .push_slice(PushBytesBuf::try_from(xonly.serialize().to_vec()).unwrap())
+            .into_script();
+        let tx = Transaction {
+            version: Version(2),
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint::default(),
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence::MAX,
+                witness: Witness::from(vec![vec![0u8; 64]]),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(0),
+                script_pubkey: ScriptBuf::new(),
+            }],
+        };
+        let tx_bytes = consensus::serialize(&tx);
+        let failure = verify_with_flags_detailed(
+            spent_script.as_bytes(),
+            0,
+            &tx_bytes,
+            None,
+            0,
+            VERIFY_P2SH | VERIFY_WITNESS | VERIFY_TAPROOT,
+        )
+        .expect_err("taproot signature path without prevouts should fail");
+        assert_eq!(failure.script_error, ScriptError::SchnorrSigHashType);
     }
 
     #[test]
@@ -1977,7 +2052,7 @@ mod tests {
         );
         let err = run_taproot_verification(spent_script.clone(), witness, VERIFY_TAPROOT)
             .expect_err("annex must commit into tapscript sighash");
-        assert_eq!(err, ScriptError::EvalFalse);
+        assert_eq!(err, ScriptError::SchnorrSig);
 
         let sig_with_annex = sign_tapscript_spend_with_annex(
             &secp,
@@ -2131,7 +2206,7 @@ mod tests {
             VERIFY_TAPROOT | VERIFY_CLEANSTACK | VERIFY_NULLFAIL,
         )
         .expect_err("invalid signature rejected");
-        assert_eq!(err, ScriptError::EvalFalse);
+        assert_eq!(err, ScriptError::SchnorrSig);
     }
 
     #[test]
@@ -2963,7 +3038,7 @@ mod tests {
         let err =
             run_taproot_verification(spent_script, witness, VERIFY_TAPROOT | VERIFY_CLEANSTACK)
                 .expect_err("byte offsets must not be interpreted as codeseparator positions");
-        assert_eq!(err, ScriptError::EvalFalse);
+        assert_eq!(err, ScriptError::SchnorrSig);
     }
 
     #[test]

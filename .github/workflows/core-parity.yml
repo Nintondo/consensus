@@ -1,0 +1,141 @@
+name: Core Parity
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+jobs:
+  core-parity:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    env:
+      RUST_BACKTRACE: "1"
+      CARGO_TERM_COLOR: always
+      SCRIPT_ASSETS_MIN_CASES: "200"
+    steps:
+      - name: Checkout consensus repo
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential \
+            cmake \
+            ninja-build \
+            pkg-config \
+            python3 \
+            curl \
+            ca-certificates
+
+      - name: Resolve pinned Core commit from repository metadata
+        id: core_commit
+        run: |
+          CORE_COMMIT="$(python3 - <<'PY'
+          import json
+          with open("tests/data/script_assets_generated_metadata.json", "r", encoding="utf-8") as f:
+              data = json.load(f)
+          print(data["source_core_commit"])
+          PY
+          )"
+          if [ -z "$CORE_COMMIT" ]; then
+            echo "Failed to resolve source_core_commit from tests/data/script_assets_generated_metadata.json" >&2
+            exit 1
+          fi
+          echo "core_commit=$CORE_COMMIT" >> "$GITHUB_OUTPUT"
+          echo "Using pinned Bitcoin Core commit: $CORE_COMMIT"
+
+      - name: Checkout Bitcoin Core
+        uses: actions/checkout@v4
+        with:
+          repository: bitcoin/bitcoin
+          path: bitcoin-core
+          fetch-depth: 0
+
+      - name: Pin Bitcoin Core to metadata commit
+        run: |
+          git -C bitcoin-core checkout "${{ steps.core_commit.outputs.core_commit }}"
+          git -C bitcoin-core rev-parse HEAD
+
+      - name: Build Core runtime helper
+        run: |
+          cmake -S tests/core_cpp_helper \
+            -B "${RUNNER_TEMP}/core_cpp_helper" \
+            -DBITCOIN_CORE_REPO="${GITHUB_WORKSPACE}/bitcoin-core"
+          cmake --build "${RUNNER_TEMP}/core_cpp_helper" --target core_consensus_helper -j"$(nproc)"
+          echo "CORE_CPP_DIFF_HELPER_BIN=${RUNNER_TEMP}/core_cpp_helper/core_consensus_helper" >> "$GITHUB_ENV"
+
+      - name: Verify vendored fixture hashes against pinned Core
+        env:
+          BITCOIN_CORE_REPO: ${{ github.workspace }}/bitcoin-core
+        run: cargo test --test core_fixture_hashes -- --nocapture
+
+      - name: Strict direct Core runtime differential
+        env:
+          CORE_CPP_DIFF_HELPER_BIN: ${{ env.CORE_CPP_DIFF_HELPER_BIN }}
+          CORE_CPP_DIFF_REQUIRED: "1"
+          CORE_CPP_DIFF_STRICT: "1"
+          CORE_CPP_DIFF_ACCEPTED_SKIPS: "noncanonical_flags,placeholder_vectors"
+          CORE_CPP_DIFF_SCRIPT_LIMIT: "100000"
+          CORE_CPP_DIFF_TX_LIMIT: "100000"
+        run: cargo test --features core-diff --test core_cpp_runtime_diff -- --nocapture
+
+      - name: Helper-backed full-flag differential suites
+        env:
+          CORE_CPP_DIFF_HELPER_BIN: ${{ env.CORE_CPP_DIFF_HELPER_BIN }}
+          CORE_CPP_DIFF_STRICT: "1"
+          CORE_CPP_DIFF_ACCEPTED_SKIPS: "noncanonical_flags"
+        run: cargo test --features core-diff --test core_tx_vectors --test script_vectors --test random_consistency -- --nocapture
+
+      - name: Resolve upstream script-assets corpus inputs
+        id: script_assets_inputs
+        env:
+          SCRIPT_ASSETS_UPSTREAM_JSON_URL: ${{ vars.SCRIPT_ASSETS_UPSTREAM_JSON_URL }}
+          SCRIPT_ASSETS_UPSTREAM_METADATA_URL: ${{ vars.SCRIPT_ASSETS_UPSTREAM_METADATA_URL }}
+          SCRIPT_ASSETS_UPSTREAM_AUTH_HEADER: ${{ secrets.SCRIPT_ASSETS_UPSTREAM_AUTH_HEADER }}
+        run: |
+          set -euo pipefail
+          if [ -n "${SCRIPT_ASSETS_UPSTREAM_JSON_URL:-}" ] && [ -n "${SCRIPT_ASSETS_UPSTREAM_METADATA_URL:-}" ]; then
+            json_path="${RUNNER_TEMP}/script_assets_test.json"
+            metadata_path="${RUNNER_TEMP}/script_assets_test.metadata.json"
+            if [ -n "${SCRIPT_ASSETS_UPSTREAM_AUTH_HEADER:-}" ]; then
+              curl --fail --location --silent --show-error --header "$SCRIPT_ASSETS_UPSTREAM_AUTH_HEADER" "$SCRIPT_ASSETS_UPSTREAM_JSON_URL" --output "$json_path"
+              curl --fail --location --silent --show-error --header "$SCRIPT_ASSETS_UPSTREAM_AUTH_HEADER" "$SCRIPT_ASSETS_UPSTREAM_METADATA_URL" --output "$metadata_path"
+            else
+              curl --fail --location --silent --show-error "$SCRIPT_ASSETS_UPSTREAM_JSON_URL" --output "$json_path"
+              curl --fail --location --silent --show-error "$SCRIPT_ASSETS_UPSTREAM_METADATA_URL" --output "$metadata_path"
+            fi
+          else
+            json_path="${GITHUB_WORKSPACE}/tests/data/script_assets_upstream.json"
+            metadata_path="${GITHUB_WORKSPACE}/tests/data/script_assets_upstream_metadata.json"
+          fi
+
+          if [ ! -f "$json_path" ]; then
+            echo "Missing upstream script-assets JSON at $json_path" >&2
+            echo "Provide repository variable SCRIPT_ASSETS_UPSTREAM_JSON_URL or commit tests/data/script_assets_upstream.json" >&2
+            exit 1
+          fi
+          if [ ! -f "$metadata_path" ]; then
+            echo "Missing upstream script-assets metadata at $metadata_path" >&2
+            echo "Provide repository variable SCRIPT_ASSETS_UPSTREAM_METADATA_URL or commit tests/data/script_assets_upstream_metadata.json" >&2
+            exit 1
+          fi
+          echo "json_path=$json_path" >> "$GITHUB_OUTPUT"
+          echo "metadata_path=$metadata_path" >> "$GITHUB_OUTPUT"
+
+      - name: Script-assets parity profile with upstream artifact integrity pinning
+        env:
+          SCRIPT_ASSETS_PARITY_PROFILE: "1"
+          SCRIPT_ASSETS_REQUIRE_UPSTREAM: "1"
+          SCRIPT_ASSETS_UPSTREAM_JSON: ${{ steps.script_assets_inputs.outputs.json_path }}
+          SCRIPT_ASSETS_UPSTREAM_METADATA_JSON: ${{ steps.script_assets_inputs.outputs.metadata_path }}
+          SCRIPT_ASSETS_MIN_CASES: ${{ env.SCRIPT_ASSETS_MIN_CASES }}
+        run: cargo test --test script_assets -- --nocapture

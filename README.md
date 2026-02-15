@@ -4,25 +4,25 @@ Pure Rust implementation of Bitcoin's `libbitcoinconsensus` verification surface
 
 ## Status
 
-- Legacy, P2SH, SegWit v0, and Taproot/Tapscript verification paths are implemented.
-- Differential testing against Bitcoin Core runtime surfaces is available behind `core-diff`.
-- Core vector suites are vendored in-tree and exercised by tests.
+- Legacy, P2SH, SegWit v0, and Taproot/Tapscript validation are implemented.
+- Differential checks against Bitcoin Core are available with the `core-diff` feature.
+- Core vectors are vendored in `tests/data/`.
+- Large script-assets corpus support is available via upstream minimizer artifacts.
 
-## Features
+## API
 
-- API compatible surface in `src/lib.rs`:
-  - `verify`
-  - `verify_with_flags`
-  - `verify_with_details`
-  - `verify_with_flags_detailed`
-- Script flags and error codes aligned with `libbitcoinconsensus` semantics.
-- Core-parity coverage through script vectors, tx corpus replay, sighash vectors, BIP341 wallet vectors, and randomized differential tests.
+Main entrypoints in `src/lib.rs`:
+
+- `verify`
+- `verify_with_flags`
+- `verify_with_details`
+- `verify_with_flags_detailed`
 
 ## Feature Flags
 
 - `std` (default)
 - `external-secp` (implies `std`)
-- `core-diff` (enables Core differential tests/benchmarks)
+- `core-diff` (enables Core runtime differential tests/benchmarks)
 
 ## Quick Start
 
@@ -34,17 +34,13 @@ cargo test
 cargo test --features core-diff
 ```
 
+Fixture integrity check:
+
 ```bash
 cargo test --test core_fixture_hashes
 ```
 
-If you want fixture source checks against your local Bitcoin Core checkout:
-
-```bash
-BITCOIN_CORE_REPO=/path/to/bitcoin cargo test --test core_fixture_hashes
-```
-
-Direct C++ runtime differential harness for current Core (v28+):
+Core runtime differential (local Core checkout required):
 
 ```bash
 BITCOIN_CORE_REPO=/path/to/bitcoin \
@@ -52,24 +48,25 @@ CORE_CPP_DIFF_BUILD_HELPER=1 \
 cargo test --features core-diff --test core_cpp_runtime_diff -- --nocapture
 ```
 
-Or prebuild once and point directly at the helper binary:
-
-```bash
-cmake -S tests/core_cpp_helper -B /tmp/core_cpp_helper -DBITCOIN_CORE_REPO=/path/to/bitcoin
-cmake --build /tmp/core_cpp_helper --target core_consensus_helper -j4
-CORE_CPP_DIFF_HELPER_BIN=/tmp/core_cpp_helper/core_consensus_helper \
-cargo test --features core-diff --test core_cpp_runtime_diff -- --nocapture
-```
-
-Parity-audit mode (fail if backend is missing and fail on unaccepted skips):
+Strict parity mode:
 
 ```bash
 BITCOIN_CORE_REPO=/path/to/bitcoin \
 CORE_CPP_DIFF_BUILD_HELPER=1 \
 CORE_CPP_DIFF_REQUIRED=1 \
 CORE_CPP_DIFF_STRICT=1 \
-CORE_CPP_DIFF_ACCEPTED_SKIPS=unsupported_flags \
+CORE_CPP_DIFF_ACCEPTED_SKIPS=noncanonical_flags,placeholder_vectors \
 cargo test --features core-diff --test core_cpp_runtime_diff -- --nocapture
+```
+
+Script-assets parity profile:
+
+```bash
+SCRIPT_ASSETS_PARITY_PROFILE=1 \
+SCRIPT_ASSETS_REQUIRE_UPSTREAM=1 \
+SCRIPT_ASSETS_UPSTREAM_JSON=/path/to/script_assets_test.json \
+SCRIPT_ASSETS_UPSTREAM_METADATA_JSON=/path/to/script_assets_test.metadata.json \
+cargo test --test script_assets -- --nocapture
 ```
 
 ## Benchmarks
@@ -82,15 +79,20 @@ cargo bench --bench verification
 cargo bench --bench verification --features core-diff
 ```
 
-## Repository Map
+## Project Layout
 
-- `src/lib.rs`: public API and top-level verification flow
-- `src/script.rs`: script interpreter and opcode/flag rules
-- `src/tx.rs`: transaction parsing and sighash precompute helpers
-- `tests/`: vector, corpus, and differential parity suites
-- `docs/integration-roadmap.md`: parity roadmap and audit backlog
+- `src/lib.rs`: public API and verification flow
+- `src/script.rs`: script interpreter
+- `src/tx.rs`: transaction parsing and sighash helpers
+- `tests/`: vectors, corpus checks, and differential suites
+
+## Documentation
+
+- `docs/integration-roadmap.md`: parity roadmap and findings
+- `docs/github-ci.md`: CI and GitHub setup details
 
 ## Notes
 
-- Taproot verification requires prevout context (`spent_outputs`).
-- `CONSENSUS_VERSION` is currently a placeholder (`0`).
+- Taproot checksig/sighash paths require prevout context (`spent_outputs`).
+- Under `VERIFY_TAPROOT`, non-taproot execution paths do not fail early when prevouts are absent.
+- Amount semantics follow Core runtime: explicit `amount` is authoritative for checksig/sighash.

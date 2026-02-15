@@ -1,5 +1,7 @@
 #![cfg(feature = "core-diff")]
 
+mod core_diff_bridge;
+
 use bitcoin::{
     absolute::LockTime,
     blockdata::script::{Builder, Instruction as ScriptInstruction, PushBytesBuf},
@@ -18,8 +20,10 @@ use consensus::{
     VERIFY_NULLDUMMY, VERIFY_NULLFAIL, VERIFY_P2SH, VERIFY_STRICTENC, VERIFY_TAPROOT,
     VERIFY_WITNESS,
 };
+use core_diff_bridge::{CoreDiffHarness, CoreUtxo, LEGACY_LIBCONSENSUS_SUPPORTED_FLAGS};
 use proptest::prelude::*;
-use std::{fmt, slice};
+use proptest::test_runner::{Config as ProptestConfig, TestCaseError, TestRunner};
+use std::{cell::RefCell, collections::BTreeMap, env, fmt, slice};
 
 const FLAG_SET: &[u32] = &[
     VERIFY_P2SH,
@@ -35,14 +39,6 @@ const FLAG_SET: &[u32] = &[
     VERIFY_NULLFAIL,
     VERIFY_TAPROOT,
 ];
-
-const LIBCONSENSUS_SUPPORTED_FLAGS: u32 = VERIFY_P2SH
-    | VERIFY_DERSIG
-    | VERIFY_NULLDUMMY
-    | VERIFY_CHECKLOCKTIMEVERIFY
-    | VERIFY_CHECKSEQUENCEVERIFY
-    | VERIFY_WITNESS
-    | VERIFY_TAPROOT;
 
 struct RandomCase {
     tx_bytes: Vec<u8>,
@@ -64,7 +60,7 @@ impl fmt::Debug for RandomCase {
 
 struct Prevout {
     ours: Utxo,
-    core: bitcoinconsensus::Utxo,
+    core: CoreUtxo,
 }
 
 impl Prevout {
@@ -77,7 +73,7 @@ impl Prevout {
                 script_pubkey_len: len,
                 value: amount as i64,
             },
-            core: bitcoinconsensus::Utxo {
+            core: CoreUtxo {
                 script_pubkey: ptr,
                 script_pubkey_len: len,
                 value: amount as i64,
@@ -86,30 +82,107 @@ impl Prevout {
     }
 }
 
-proptest! {
-    #![proptest_config(ProptestConfig::with_cases(256))]
-    #[test]
-    fn random_scripts_match_libconsensus(case in random_case_strategy()) {
-        run_random_case(&case);
+#[derive(Default)]
+struct RandomDiffStats {
+    total_cases: usize,
+    helper_differential_cases: usize,
+    legacy_differential_cases: usize,
+    skipped_unsupported_flags: usize,
+    skipped_taproot_without_spent_outputs_api: usize,
+    skip_reasons: BTreeMap<String, usize>,
+}
+
+#[test]
+fn random_scripts_match_core_runtime() {
+    let strict_helper = env::var("CORE_CPP_DIFF_STRICT").ok().as_deref() == Some("1");
+    let runtime = CoreDiffHarness::from_env()
+        .unwrap_or_else(|err| panic!("core runtime harness init failed: {err}"));
+    let backend_label = runtime
+        .as_ref()
+        .map(|h| h.backend_label())
+        .unwrap_or_else(|| "crate-libbitcoinconsensus".to_string());
+    if strict_helper {
+        match runtime.as_ref() {
+            Some(harness) if harness.is_helper_backend() => {}
+            Some(harness) => {
+                panic!(
+                    "CORE_CPP_DIFF_STRICT=1 requires helper backend for random_consistency, got {}",
+                    harness.backend_label()
+                );
+            }
+            None => {
+                panic!(
+                    "CORE_CPP_DIFF_STRICT=1 requires helper backend for random_consistency; \
+                     set CORE_CPP_DIFF_HELPER_BIN or CORE_CPP_DIFF_BUILD_HELPER=1 with BITCOIN_CORE_REPO"
+                );
+            }
+        }
+    }
+
+    let runtime = RefCell::new(runtime);
+    let stats = RefCell::new(RandomDiffStats::default());
+    let mut runner = TestRunner::new(ProptestConfig::with_cases(256));
+    let strategy = random_case_strategy();
+    runner
+        .run(&strategy, |case| {
+            let mut runtime_ref = runtime.borrow_mut();
+            let mut stats_ref = stats.borrow_mut();
+            run_random_case(&case, runtime_ref.as_mut(), &mut stats_ref)
+                .map_err(TestCaseError::fail)
+        })
+        .unwrap_or_else(|err| panic!("random differential case failed: {err}"));
+
+    let stats = stats.into_inner();
+    let total_differential = stats.helper_differential_cases + stats.legacy_differential_cases;
+    assert!(
+        total_differential > 0,
+        "random consistency executed no differential checks"
+    );
+
+    if strict_helper {
+        assert!(
+            stats.helper_differential_cases > 0,
+            "strict helper profile expected helper-backed random comparisons"
+        );
+        assert_eq!(
+            stats.legacy_differential_cases, 0,
+            "strict helper profile must not fall back to legacy differential"
+        );
+        assert_eq!(
+            stats.skipped_unsupported_flags, 0,
+            "strict helper profile must not skip unsupported flags"
+        );
+        assert_eq!(
+            stats.skipped_taproot_without_spent_outputs_api, 0,
+            "strict helper profile must not skip taproot due missing spent-outputs API"
+        );
+        assert!(
+            stats.skip_reasons.is_empty(),
+            "strict helper profile observed skip reasons: {:?}",
+            stats.skip_reasons
+        );
+    }
+
+    println!(
+        "random_consistency coverage: backend={} total_cases={} helper_differential={} legacy_differential={} skipped_unsupported={} skipped_taproot_no_spent_outputs={}",
+        backend_label,
+        stats.total_cases,
+        stats.helper_differential_cases,
+        stats.legacy_differential_cases,
+        stats.skipped_unsupported_flags,
+        stats.skipped_taproot_without_spent_outputs_api
+    );
+    if !stats.skip_reasons.is_empty() {
+        println!("random_consistency skips: {:?}", stats.skip_reasons);
     }
 }
 
-fn run_random_case(case: &RandomCase) {
-    let canonical_combo = (case.flags & VERIFY_WITNESS == 0 || case.flags & VERIFY_P2SH != 0)
-        && (case.flags & VERIFY_TAPROOT == 0 || case.flags & VERIFY_WITNESS != 0);
-    if case.flags & !LIBCONSENSUS_SUPPORTED_FLAGS != 0 || !canonical_combo {
-        // libbitcoinconsensus does not understand some policy-only bits; skip the differential
-        // comparison for those inputs and only validate our interpreter.
-        let _ = verify_with_flags_detailed(
-            case.script_pubkey.as_bytes(),
-            case.amount,
-            &case.tx_bytes,
-            case.prevout.as_ref().map(|p| slice::from_ref(&p.ours)),
-            0,
-            case.flags,
-        );
-        return;
-    }
+fn run_random_case(
+    case: &RandomCase,
+    runtime: Option<&mut CoreDiffHarness>,
+    stats: &mut RandomDiffStats,
+) -> Result<(), String> {
+    stats.total_cases += 1;
 
     let ours = verify_with_flags_detailed(
         case.script_pubkey.as_bytes(),
@@ -119,23 +192,114 @@ fn run_random_case(case: &RandomCase) {
         0,
         case.flags,
     );
-    let core = bitcoinconsensus::verify_with_flags(
-        case.script_pubkey.as_bytes(),
-        case.amount,
-        &case.tx_bytes,
-        case.prevout.as_ref().map(|p| slice::from_ref(&p.core)),
-        0,
-        case.flags,
-    );
 
-    let ours_ok = ours.is_ok();
-    let core_ok = core.is_ok();
-    assert!(
-        ours_ok == core_ok,
-        "random case diverged\nscriptPubKey={:?}\nflags={:#x}\nours={ours:?}\ncore={core:?}",
-        case.script_pubkey,
-        case.flags
-    );
+    match runtime {
+        Some(harness) => {
+            let supported_flags = harness.supported_flags_mask();
+            if case.flags & !supported_flags != 0 {
+                stats.skipped_unsupported_flags += 1;
+                *stats
+                    .skip_reasons
+                    .entry("unsupported_flags_for_backend".to_string())
+                    .or_insert(0) += 1;
+                return Ok(());
+            }
+            if !harness.is_helper_backend()
+                && case.flags & VERIFY_TAPROOT != 0
+                && case.prevout.is_none()
+            {
+                stats.skipped_unsupported_flags += 1;
+                *stats
+                    .skip_reasons
+                    .entry("legacy_taproot_without_prevout_context".to_string())
+                    .or_insert(0) += 1;
+                return Ok(());
+            }
+            if case.flags & VERIFY_TAPROOT != 0 && !harness.has_spent_outputs_api() {
+                stats.skipped_taproot_without_spent_outputs_api += 1;
+                *stats
+                    .skip_reasons
+                    .entry("taproot_without_spent_outputs_api".to_string())
+                    .or_insert(0) += 1;
+                return Ok(());
+            }
+
+            let core = harness
+                .verify(
+                    case.script_pubkey.as_bytes(),
+                    case.amount,
+                    &case.tx_bytes,
+                    case.prevout.as_ref().map(|p| slice::from_ref(&p.core)),
+                    0,
+                    case.flags,
+                )
+                .map_err(|err| {
+                    format!(
+                        "core runtime call failed for random case flags={:#x}: {err}",
+                        case.flags
+                    )
+                })?;
+
+            if harness.is_helper_backend() {
+                stats.helper_differential_cases += 1;
+            } else {
+                stats.legacy_differential_cases += 1;
+            }
+
+            if ours.is_ok() != core.ok {
+                return Err(format!(
+                    "random case diverged\nbackend={}\nscriptPubKey={:?}\nflags={:#x}\nours={ours:?}\ncore_ok={}\ncore_err={}",
+                    harness.backend_label(),
+                    case.script_pubkey,
+                    case.flags,
+                    core.ok,
+                    core.err_code
+                ));
+            }
+            Ok(())
+        }
+        None => {
+            if case.flags & !LEGACY_LIBCONSENSUS_SUPPORTED_FLAGS != 0 {
+                stats.skipped_unsupported_flags += 1;
+                *stats
+                    .skip_reasons
+                    .entry("unsupported_flags_without_runtime_backend".to_string())
+                    .or_insert(0) += 1;
+                return Ok(());
+            }
+            if case.flags & VERIFY_TAPROOT != 0 && case.prevout.is_none() {
+                stats.skipped_unsupported_flags += 1;
+                *stats
+                    .skip_reasons
+                    .entry("legacy_taproot_without_prevout_context".to_string())
+                    .or_insert(0) += 1;
+                return Ok(());
+            }
+
+            let core_prevout = case.prevout.as_ref().map(|p| bitcoinconsensus::Utxo {
+                script_pubkey: p.core.script_pubkey,
+                script_pubkey_len: p.core.script_pubkey_len,
+                value: p.core.value,
+            });
+            let core = bitcoinconsensus::verify_with_flags(
+                case.script_pubkey.as_bytes(),
+                case.amount,
+                &case.tx_bytes,
+                core_prevout.as_ref().map(slice::from_ref),
+                0,
+                case.flags,
+            );
+            stats.legacy_differential_cases += 1;
+
+            if ours.is_ok() != core.is_ok() {
+                return Err(format!(
+                    "random case diverged\nbackend=crate-libbitcoinconsensus\nscriptPubKey={:?}\nflags={:#x}\nours={ours:?}\ncore={core:?}",
+                    case.script_pubkey, case.flags
+                ));
+            }
+            Ok(())
+        }
+    }
 }
 
 fn random_case_strategy() -> impl Strategy<Value = RandomCase> {

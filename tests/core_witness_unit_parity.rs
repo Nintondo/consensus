@@ -35,7 +35,9 @@ fn p2wpkh_script(pubkey: &PublicKey) -> ScriptBuf {
     let program = Hash160::hash(&pubkey.serialize());
     Builder::new()
         .push_opcode(all::OP_PUSHBYTES_0)
-        .push_slice(PushBytesBuf::try_from(program.to_byte_array().to_vec()).expect("program bytes"))
+        .push_slice(
+            PushBytesBuf::try_from(program.to_byte_array().to_vec()).expect("program bytes"),
+        )
         .into_script()
 }
 
@@ -44,7 +46,9 @@ fn p2wpkh_script_code(pubkey: &PublicKey) -> ScriptBuf {
     Builder::new()
         .push_opcode(all::OP_DUP)
         .push_opcode(all::OP_HASH160)
-        .push_slice(PushBytesBuf::try_from(program.to_byte_array().to_vec()).expect("hash160 bytes"))
+        .push_slice(
+            PushBytesBuf::try_from(program.to_byte_array().to_vec()).expect("hash160 bytes"),
+        )
         .push_opcode(all::OP_EQUALVERIFY)
         .push_opcode(all::OP_CHECKSIG)
         .into_script()
@@ -102,7 +106,14 @@ fn assert_verify_matches_core(
     expect_ok: bool,
 ) -> Result<(), ScriptFailure> {
     let tx_bytes = btc_consensus::serialize(tx);
-    let ours = verify_with_flags_detailed(spent_script.as_bytes(), amount_sat, &tx_bytes, None, 0, flags);
+    let ours = verify_with_flags_detailed(
+        spent_script.as_bytes(),
+        amount_sat,
+        &tx_bytes,
+        None,
+        0,
+        flags,
+    );
 
     #[cfg(feature = "core-diff")]
     {
@@ -199,7 +210,8 @@ fn core_transaction_tests_test_witness_p2sh_p2wpkh_wrong_witness_and_wrong_redee
         Witness::new(),
         amount_sat,
     );
-    let sig_wrong_witness = sign_p2wpkh_input(&secp, &tx_wrong_witness, &pubkey2, amount_sat, &key2);
+    let sig_wrong_witness =
+        sign_p2wpkh_input(&secp, &tx_wrong_witness, &pubkey2, amount_sat, &key2);
     tx_wrong_witness.input[0].witness =
         Witness::from(vec![sig_wrong_witness, pubkey2.serialize().to_vec()]);
 
@@ -207,10 +219,22 @@ fn core_transaction_tests_test_witness_p2sh_p2wpkh_wrong_witness_and_wrong_redee
         assert_verify_matches_core(&spent_script, amount_sat, &tx_good, flags, true)
             .expect("good p2sh-p2wpkh spend should pass");
     }
-    assert_verify_matches_core(&spent_script, amount_sat, &tx_wrong_witness, VERIFY_NONE, true)
-        .expect("without witness verification, wrong witness stack is ignored");
-    assert_verify_matches_core(&spent_script, amount_sat, &tx_wrong_witness, VERIFY_P2SH, true)
-        .expect("without witness verification, wrong witness stack is ignored");
+    assert_verify_matches_core(
+        &spent_script,
+        amount_sat,
+        &tx_wrong_witness,
+        VERIFY_NONE,
+        true,
+    )
+    .expect("without witness verification, wrong witness stack is ignored");
+    assert_verify_matches_core(
+        &spent_script,
+        amount_sat,
+        &tx_wrong_witness,
+        VERIFY_P2SH,
+        true,
+    )
+    .expect("without witness verification, wrong witness stack is ignored");
     assert_verify_matches_core(
         &spent_script,
         amount_sat,
@@ -268,7 +292,8 @@ fn core_transaction_tests_spends_witness_prog_wrapped_witness_detection_surface(
     let redeem_script = Builder::new()
         .push_opcode(all::OP_PUSHBYTES_0)
         .push_slice(
-            PushBytesBuf::try_from(witness_program.to_byte_array().to_vec()).expect("program bytes"),
+            PushBytesBuf::try_from(witness_program.to_byte_array().to_vec())
+                .expect("program bytes"),
         )
         .into_script();
     let spent_script = ScriptBuf::new_p2sh(&redeem_script.script_hash());
@@ -302,5 +327,8 @@ fn core_transaction_tests_spends_witness_prog_wrapped_witness_detection_surface(
         false,
     )
     .expect_err("without redeem script there is no wrapped witness dispatch");
-    assert_eq!(without_redeem.script_error, ScriptError::InvalidStackOperation);
+    assert_eq!(
+        without_redeem.script_error,
+        ScriptError::InvalidStackOperation
+    );
 }

@@ -1,5 +1,6 @@
 #![cfg(feature = "core-diff")]
 
+mod core_diff_bridge;
 mod script_asm;
 
 use bitcoin::{consensus as btc_consensus, hex::FromHex, OutPoint, ScriptBuf, Transaction, Txid};
@@ -12,23 +13,18 @@ use consensus::{
     VERIFY_P2SH, VERIFY_SIGPUSHONLY, VERIFY_STRICTENC, VERIFY_TAPROOT, VERIFY_WITNESS,
     VERIFY_WITNESS_PUBKEYTYPE,
 };
+use core_diff_bridge::{CoreDiffHarness, CoreUtxo, LEGACY_LIBCONSENSUS_SUPPORTED_FLAGS};
 use script_asm::parse_script;
 use serde_json::Value;
 use std::{
     collections::{BTreeMap, HashMap},
+    env,
     str::FromStr,
 };
 
 const CORE_TX_VALID: &str = include_str!("data/tx_valid.json");
 const CORE_TX_INVALID: &str = include_str!("data/tx_invalid.json");
 
-const DIFF_SUPPORTED_FLAGS: u32 = VERIFY_P2SH
-    | VERIFY_DERSIG
-    | VERIFY_NULLDUMMY
-    | VERIFY_CHECKLOCKTIMEVERIFY
-    | VERIFY_CHECKSEQUENCEVERIFY
-    | VERIFY_WITNESS
-    | VERIFY_TAPROOT;
 const ALL_TX_VECTOR_FLAGS: u32 = VERIFY_P2SH
     | VERIFY_STRICTENC
     | VERIFY_DERSIG
@@ -66,12 +62,17 @@ enum FlagParseError {
 struct DiffCoverageStats {
     total_vectors: usize,
     checked_vectors: usize,
-    differential_vectors: usize,
+    helper_differential_vectors: usize,
+    legacy_differential_vectors: usize,
     projected_to_diff_vectors: usize,
     skipped_projection_vectors: usize,
+    skipped_noncanonical_flags: usize,
+    skipped_unsupported_flags: usize,
+    skipped_taproot_without_spent_outputs_api: usize,
     skipped_badtx: usize,
     unknown_token_counts: BTreeMap<String, usize>,
     projection_skip_reasons: BTreeMap<String, usize>,
+    differential_skip_reasons: BTreeMap<String, usize>,
 }
 
 #[derive(Debug)]
@@ -143,8 +144,11 @@ fn fill_flags(flags: u32) -> u32 {
     out
 }
 
-fn project_tx_valid_diff_flags(direct_flags: u32) -> Result<u32, ProjectionSkipReason> {
-    let projected = direct_flags & DIFF_SUPPORTED_FLAGS;
+fn project_tx_valid_diff_flags(
+    direct_flags: u32,
+    supported_flags: u32,
+) -> Result<u32, ProjectionSkipReason> {
+    let projected = direct_flags & supported_flags;
     if fill_flags(projected) != projected {
         return Err(ProjectionSkipReason::NonCanonicalProjectedFlags {
             projected_flags: projected,
@@ -181,7 +185,96 @@ fn parse_prevouts(raw_inputs: &[Value]) -> HashMap<OutPoint, PrevoutData> {
     out
 }
 
-fn run_case_differential(
+fn run_case_differential_via_harness(
+    harness: &mut CoreDiffHarness,
+    tx: &Transaction,
+    prevouts: &HashMap<OutPoint, PrevoutData>,
+    flags: u32,
+    label: &str,
+) -> Result<(), String> {
+    let tx_bytes = btc_consensus::serialize(tx);
+    let mut ordered_prevouts = Vec::with_capacity(tx.input.len());
+    let mut script_storage = Vec::with_capacity(tx.input.len());
+    for txin in &tx.input {
+        let prevout = prevouts
+            .get(&txin.previous_output)
+            .unwrap_or_else(|| {
+                panic!(
+                    "missing prevout {:?} for case {label}",
+                    txin.previous_output
+                )
+            })
+            .clone();
+        script_storage.push(prevout.script_pubkey.as_bytes().to_vec());
+        ordered_prevouts.push(prevout);
+    }
+
+    let ours_utxos: Vec<Utxo> = ordered_prevouts
+        .iter()
+        .zip(script_storage.iter())
+        .map(|(prevout, script_bytes)| Utxo {
+            script_pubkey: script_bytes.as_ptr(),
+            script_pubkey_len: script_bytes.len() as u32,
+            value: prevout.amount_sat as i64,
+        })
+        .collect();
+    let core_utxos: Vec<CoreUtxo> = ordered_prevouts
+        .iter()
+        .zip(script_storage.iter())
+        .map(|(prevout, script_bytes)| CoreUtxo {
+            script_pubkey: script_bytes.as_ptr(),
+            script_pubkey_len: script_bytes.len() as u32,
+            value: prevout.amount_sat as i64,
+        })
+        .collect();
+
+    let ours_spent = if flags & VERIFY_TAPROOT != 0 {
+        Some(ours_utxos.as_slice())
+    } else {
+        None
+    };
+    let core_spent = if flags & VERIFY_TAPROOT != 0 {
+        Some(core_utxos.as_slice())
+    } else {
+        None
+    };
+
+    for (index, prevout) in ordered_prevouts.iter().enumerate() {
+        let ours = verify_with_flags_detailed(
+            prevout.script_pubkey.as_bytes(),
+            prevout.amount_sat,
+            &tx_bytes,
+            ours_spent,
+            index,
+            flags,
+        );
+        let core = harness
+            .verify(
+                prevout.script_pubkey.as_bytes(),
+                prevout.amount_sat,
+                &tx_bytes,
+                core_spent,
+                index,
+                flags,
+            )
+            .map_err(|err| {
+                format!(
+                    "core runtime differential call failed for {label} input={index} flags={flags:#x}: {err}"
+                )
+            })?;
+        assert_eq!(
+            ours.is_ok(),
+            core.ok,
+            "tx differential mismatch for {label}: backend={} input={index} flags={flags:#x} ours={ours:?} core_ok={} core_err={}",
+            harness.backend_label(),
+            core.ok,
+            core.err_code,
+        );
+    }
+    Ok(())
+}
+
+fn run_case_differential_via_crate(
     tx: &Transaction,
     prevouts: &HashMap<OutPoint, PrevoutData>,
     flags: u32,
@@ -328,6 +421,31 @@ fn run_case_local_expectation(
 fn run_tx_vector_file(vectors: &str, expect_success: bool) {
     let tests: Vec<Value> = serde_json::from_str(vectors).expect("tx vectors parse");
     let mut stats = DiffCoverageStats::default();
+    let strict_helper = env::var("CORE_CPP_DIFF_STRICT").ok().as_deref() == Some("1");
+    let mut runtime = CoreDiffHarness::from_env()
+        .unwrap_or_else(|err| panic!("core runtime harness init failed: {err}"));
+    let backend_label = runtime
+        .as_ref()
+        .map(|h| h.backend_label())
+        .unwrap_or_else(|| "crate-libbitcoinconsensus".to_string());
+
+    if strict_helper {
+        match runtime.as_ref() {
+            Some(harness) if harness.is_helper_backend() => {}
+            Some(harness) => {
+                panic!(
+                    "CORE_CPP_DIFF_STRICT=1 requires helper backend for core_tx_vectors, got {}",
+                    harness.backend_label()
+                );
+            }
+            None => {
+                panic!(
+                    "CORE_CPP_DIFF_STRICT=1 requires helper backend for core_tx_vectors; \
+                     set CORE_CPP_DIFF_HELPER_BIN or CORE_CPP_DIFF_BUILD_HELPER=1 with BITCOIN_CORE_REPO"
+                );
+            }
+        }
+    }
 
     for case in tests {
         let arr = match case.as_array() {
@@ -358,12 +476,22 @@ fn run_tx_vector_file(vectors: &str, expect_success: bool) {
             // In tx_valid, the JSON field is the excluded flag mask.
             let included = ALL_TX_VECTOR_FLAGS & !parsed_flags;
             if fill_flags(included) != included {
+                stats.skipped_noncanonical_flags += 1;
+                *stats
+                    .differential_skip_reasons
+                    .entry("noncanonical_direct_flags".to_string())
+                    .or_insert(0) += 1;
                 continue;
             }
             included
         } else {
             // In tx_invalid, the JSON field is the direct required flag mask.
             if fill_flags(parsed_flags) != parsed_flags {
+                stats.skipped_noncanonical_flags += 1;
+                *stats
+                    .differential_skip_reasons
+                    .entry("noncanonical_direct_flags".to_string())
+                    .or_insert(0) += 1;
                 continue;
             }
             parsed_flags
@@ -377,23 +505,97 @@ fn run_tx_vector_file(vectors: &str, expect_success: bool) {
         run_case_local_expectation(&tx, &prevouts, direct_flags, tx_hex, expect_success);
         stats.checked_vectors += 1;
 
-        if direct_flags & !DIFF_SUPPORTED_FLAGS == 0 {
-            run_case_differential(&tx, &prevouts, direct_flags, tx_hex);
-            stats.differential_vectors += 1;
+        let mut compared = false;
+        if let Some(harness) = runtime.as_mut() {
+            let supported_flags = harness.supported_flags_mask();
+            if direct_flags & !supported_flags != 0 {
+                stats.skipped_unsupported_flags += 1;
+                *stats
+                    .differential_skip_reasons
+                    .entry("unsupported_flags_for_backend".to_string())
+                    .or_insert(0) += 1;
+            } else if direct_flags & VERIFY_TAPROOT != 0 && !harness.has_spent_outputs_api() {
+                stats.skipped_taproot_without_spent_outputs_api += 1;
+                *stats
+                    .differential_skip_reasons
+                    .entry("taproot_without_spent_outputs_api".to_string())
+                    .or_insert(0) += 1;
+            } else if harness.is_helper_backend() {
+                run_case_differential_via_harness(harness, &tx, &prevouts, direct_flags, tx_hex)
+                    .unwrap_or_else(|err| panic!("{err}"));
+                stats.helper_differential_vectors += 1;
+                compared = true;
+            } else if direct_flags & !LEGACY_LIBCONSENSUS_SUPPORTED_FLAGS == 0 {
+                run_case_differential_via_harness(harness, &tx, &prevouts, direct_flags, tx_hex)
+                    .unwrap_or_else(|err| panic!("{err}"));
+                stats.legacy_differential_vectors += 1;
+                compared = true;
+            } else if expect_success {
+                match project_tx_valid_diff_flags(direct_flags, LEGACY_LIBCONSENSUS_SUPPORTED_FLAGS)
+                {
+                    Ok(projected_flags) => {
+                        run_case_differential_via_harness(
+                            harness,
+                            &tx,
+                            &prevouts,
+                            projected_flags,
+                            tx_hex,
+                        )
+                        .unwrap_or_else(|err| panic!("{err}"));
+                        stats.legacy_differential_vectors += 1;
+                        stats.projected_to_diff_vectors += 1;
+                        compared = true;
+                    }
+                    Err(reason) => {
+                        stats.skipped_projection_vectors += 1;
+                        *stats
+                            .projection_skip_reasons
+                            .entry(reason.key())
+                            .or_insert(0) += 1;
+                    }
+                }
+            } else {
+                stats.skipped_unsupported_flags += 1;
+                *stats
+                    .differential_skip_reasons
+                    .entry("unsupported_flags_in_tx_invalid".to_string())
+                    .or_insert(0) += 1;
+            }
+        } else if direct_flags & !LEGACY_LIBCONSENSUS_SUPPORTED_FLAGS == 0 {
+            run_case_differential_via_crate(&tx, &prevouts, direct_flags, tx_hex);
+            stats.legacy_differential_vectors += 1;
+            compared = true;
         } else if expect_success {
-            match project_tx_valid_diff_flags(direct_flags) {
+            match project_tx_valid_diff_flags(direct_flags, LEGACY_LIBCONSENSUS_SUPPORTED_FLAGS) {
                 Ok(projected_flags) => {
-                    run_case_differential(&tx, &prevouts, projected_flags, tx_hex);
-                    stats.differential_vectors += 1;
+                    run_case_differential_via_crate(&tx, &prevouts, projected_flags, tx_hex);
+                    stats.legacy_differential_vectors += 1;
                     stats.projected_to_diff_vectors += 1;
+                    compared = true;
                 }
                 Err(reason) => {
                     stats.skipped_projection_vectors += 1;
-                    *stats.projection_skip_reasons.entry(reason.key()).or_insert(0) += 1;
+                    *stats
+                        .projection_skip_reasons
+                        .entry(reason.key())
+                        .or_insert(0) += 1;
                 }
             }
+        } else {
+            stats.skipped_unsupported_flags += 1;
+            *stats
+                .differential_skip_reasons
+                .entry("unsupported_flags_without_runtime_backend".to_string())
+                .or_insert(0) += 1;
+        }
+
+        if !compared {
+            continue;
         }
     }
+
+    let total_differential_vectors =
+        stats.helper_differential_vectors + stats.legacy_differential_vectors;
 
     assert!(
         stats.checked_vectors > 0,
@@ -407,30 +609,94 @@ fn run_tx_vector_file(vectors: &str, expect_success: bool) {
         stats.unknown_token_counts
     );
     assert!(
-        stats.differential_vectors > 0,
-        "core tx vectors executed no libbitcoinconsensus differential checks"
-    );
-    if expect_success {
-        assert!(
-            stats.projected_to_diff_vectors > 0,
-            "core tx-valid vectors executed no projected differential checks"
-        );
-    }
-    assert!(
-        stats.projection_skip_reasons.is_empty(),
-        "tx-valid differential projection skipped vectors: {:?}",
-        stats.projection_skip_reasons
+        total_differential_vectors > 0,
+        "core tx vectors executed no differential checks"
     );
 
+    if strict_helper {
+        assert!(
+            stats.helper_differential_vectors > 0,
+            "strict helper profile expected helper-backed tx vector comparisons"
+        );
+        assert_eq!(
+            stats.legacy_differential_vectors, 0,
+            "strict helper profile must not fall back to legacy differential"
+        );
+        assert_eq!(
+            stats.skipped_unsupported_flags, 0,
+            "strict helper profile must not skip unsupported flags"
+        );
+        assert_eq!(
+            stats.skipped_taproot_without_spent_outputs_api, 0,
+            "strict helper profile must not skip taproot due missing spent-outputs API"
+        );
+        let mut accepted = BTreeMap::new();
+        if let Ok(raw) = env::var("CORE_CPP_DIFF_ACCEPTED_SKIPS") {
+            for token in raw
+                .split(',')
+                .map(str::trim)
+                .filter(|token| !token.is_empty())
+            {
+                accepted.insert(token.to_string(), ());
+            }
+        }
+        let mut unaccepted = Vec::new();
+        for (reason, count) in [
+            ("noncanonical_flags", stats.skipped_noncanonical_flags),
+            ("unsupported_flags", stats.skipped_unsupported_flags),
+            (
+                "taproot_without_spent_outputs_api",
+                stats.skipped_taproot_without_spent_outputs_api,
+            ),
+            ("projection_skips", stats.skipped_projection_vectors),
+        ] {
+            if count == 0 {
+                continue;
+            }
+            if !accepted.contains_key(reason) {
+                unaccepted.push((reason, count));
+            }
+        }
+        assert!(
+            unaccepted.is_empty(),
+            "strict helper profile observed unaccepted skip reasons: {:?}; set CORE_CPP_DIFF_ACCEPTED_SKIPS=<comma-separated-reasons>",
+            unaccepted
+        );
+    } else if expect_success && stats.helper_differential_vectors == 0 {
+        assert!(
+            stats.projected_to_diff_vectors > 0,
+            "legacy differential path expected projected tx_valid comparisons"
+        );
+    }
+
+    if expect_success && stats.helper_differential_vectors == 0 {
+        assert!(
+            stats.projection_skip_reasons.is_empty(),
+            "tx-valid differential projection skipped vectors: {:?}",
+            stats.projection_skip_reasons
+        );
+    }
+
     println!(
-        "core_tx_vectors coverage: total={} checked={} differential={} projected_to_diff={} skipped_projection={} skipped_badtx={}",
+        "core_tx_vectors coverage: backend={} total={} checked={} helper_differential={} legacy_differential={} projected_to_diff={} skipped_projection={} skipped_noncanonical={} skipped_unsupported={} skipped_taproot_no_spent_outputs={} skipped_badtx={}",
+        backend_label,
         stats.total_vectors,
         stats.checked_vectors,
-        stats.differential_vectors,
+        stats.helper_differential_vectors,
+        stats.legacy_differential_vectors,
         stats.projected_to_diff_vectors,
         stats.skipped_projection_vectors,
+        stats.skipped_noncanonical_flags,
+        stats.skipped_unsupported_flags,
+        stats.skipped_taproot_without_spent_outputs_api,
         stats.skipped_badtx,
     );
+    if !stats.differential_skip_reasons.is_empty() {
+        println!(
+            "core_tx_vectors differential skips: {:?}",
+            stats.differential_skip_reasons
+        );
+    }
 }
 
 #[test]
@@ -468,7 +734,8 @@ fn parse_flags_rejects_unknown_tokens() {
 fn project_tx_valid_diff_flags_keeps_supported_flags() {
     let direct = VERIFY_P2SH | VERIFY_DERSIG | VERIFY_CHECKLOCKTIMEVERIFY | VERIFY_WITNESS;
     assert_eq!(
-        project_tx_valid_diff_flags(direct).expect("projection should succeed"),
+        project_tx_valid_diff_flags(direct, LEGACY_LIBCONSENSUS_SUPPORTED_FLAGS)
+            .expect("projection should succeed"),
         direct
     );
 }
@@ -483,14 +750,16 @@ fn project_tx_valid_diff_flags_strips_policy_flags() {
         | VERIFY_MINIMALDATA
         | VERIFY_NULLFAIL;
     assert_eq!(
-        project_tx_valid_diff_flags(direct).expect("projection should succeed"),
+        project_tx_valid_diff_flags(direct, LEGACY_LIBCONSENSUS_SUPPORTED_FLAGS)
+            .expect("projection should succeed"),
         VERIFY_P2SH | VERIFY_WITNESS | VERIFY_DERSIG
     );
 }
 
 #[test]
 fn project_tx_valid_diff_flags_rejects_noncanonical_projection() {
-    let reason = project_tx_valid_diff_flags(VERIFY_WITNESS).expect_err("projection must reject");
+    let reason = project_tx_valid_diff_flags(VERIFY_WITNESS, LEGACY_LIBCONSENSUS_SUPPORTED_FLAGS)
+        .expect_err("projection must reject");
     assert!(matches!(
         reason,
         ProjectionSkipReason::NonCanonicalProjectedFlags {

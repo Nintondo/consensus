@@ -1,3 +1,5 @@
+#[cfg(feature = "core-diff")]
+mod core_diff_bridge;
 mod script_asm;
 
 use bitcoin::{
@@ -21,11 +23,28 @@ use consensus::{
     VERIFY_MINIMALIF, VERIFY_NULLDUMMY, VERIFY_NULLFAIL, VERIFY_P2SH, VERIFY_SIGPUSHONLY,
     VERIFY_STRICTENC, VERIFY_TAPROOT, VERIFY_WITNESS, VERIFY_WITNESS_PUBKEYTYPE,
 };
+#[cfg(feature = "core-diff")]
+use core_diff_bridge::{CoreDiffHarness, CoreUtxo, LEGACY_LIBCONSENSUS_SUPPORTED_FLAGS};
 use script_asm::{parse_script, ParseScriptError};
 use serde_json::Value;
+#[cfg(feature = "core-diff")]
+use std::collections::BTreeMap;
+#[cfg(feature = "core-diff")]
+use std::env;
 use std::fmt;
 
 const SCRIPT_TEST_VECTORS: &str = include_str!("data/script_tests.json");
+
+#[cfg(feature = "core-diff")]
+#[derive(Default)]
+struct ScriptVectorDiffStats {
+    total_vectors: usize,
+    helper_differential_vectors: usize,
+    legacy_differential_vectors: usize,
+    skipped_noncanonical_flags: usize,
+    skipped_unsupported_flags: usize,
+    skipped_taproot_without_spent_outputs_api: usize,
+}
 
 #[test]
 fn bitcoin_core_script_vectors() {
@@ -33,6 +52,37 @@ fn bitcoin_core_script_vectors() {
         serde_json::from_str(SCRIPT_TEST_VECTORS).expect("script_tests.json deserializes");
 
     let mut skipped = 0usize;
+    #[cfg(feature = "core-diff")]
+    let strict_helper = env::var("CORE_CPP_DIFF_STRICT").ok().as_deref() == Some("1");
+    #[cfg(feature = "core-diff")]
+    let mut core_runtime = CoreDiffHarness::from_env()
+        .unwrap_or_else(|err| panic!("core runtime harness init failed: {err}"));
+    #[cfg(feature = "core-diff")]
+    let backend_label = core_runtime
+        .as_ref()
+        .map(|h| h.backend_label())
+        .unwrap_or_else(|| "crate-libbitcoinconsensus".to_string());
+    #[cfg(feature = "core-diff")]
+    if strict_helper {
+        match core_runtime.as_ref() {
+            Some(harness) if harness.is_helper_backend() => {}
+            Some(harness) => {
+                panic!(
+                    "CORE_CPP_DIFF_STRICT=1 requires helper backend for script_vectors, got {}",
+                    harness.backend_label()
+                );
+            }
+            None => {
+                panic!(
+                    "CORE_CPP_DIFF_STRICT=1 requires helper backend for script_vectors; \
+                     set CORE_CPP_DIFF_HELPER_BIN or CORE_CPP_DIFF_BUILD_HELPER=1 with BITCOIN_CORE_REPO"
+                );
+            }
+        }
+    }
+    #[cfg(feature = "core-diff")]
+    let mut diff_stats = ScriptVectorDiffStats::default();
+
     for (index, test) in tests.into_iter().enumerate() {
         let arr = match test.as_array() {
             Some(arr) => arr,
@@ -115,37 +165,74 @@ fn bitcoin_core_script_vectors() {
             }]
         });
         #[cfg(feature = "core-diff")]
-        let core_utxo_storage: Option<Vec<bitcoinconsensus::Utxo>> =
-            script_storage.as_ref().map(|storage| {
-                vec![bitcoinconsensus::Utxo {
-                    script_pubkey: storage.as_ptr(),
-                    script_pubkey_len: storage.len() as u32,
-                    value: amount as i64,
-                }]
-            });
+        let core_utxo_storage: Option<Vec<CoreUtxo>> = script_storage.as_ref().map(|storage| {
+            vec![CoreUtxo {
+                script_pubkey: storage.as_ptr(),
+                script_pubkey_len: storage.len() as u32,
+                value: amount as i64,
+            }]
+        });
         let spent_slice = utxo_storage.as_deref();
         let result = run_vector_case(&script_pubkey, amount, flags, &tx_bytes, spent_slice);
 
         #[cfg(feature = "core-diff")]
         {
-            let core_spent_slice = core_utxo_storage.as_deref();
-            const LIBCONSENSUS_SUPPORTED_FLAGS: u32 = VERIFY_P2SH
-                | VERIFY_DERSIG
-                | VERIFY_NULLDUMMY
-                | VERIFY_CHECKLOCKTIMEVERIFY
-                | VERIFY_CHECKSEQUENCEVERIFY
-                | VERIFY_WITNESS
-                | VERIFY_TAPROOT;
-
-            let canonical_combo = (flags & VERIFY_WITNESS == 0 || flags & VERIFY_P2SH != 0)
-                && (flags & VERIFY_TAPROOT == 0 || flags & VERIFY_WITNESS != 0);
-            if flags & !LIBCONSENSUS_SUPPORTED_FLAGS == 0 && canonical_combo {
+            diff_stats.total_vectors += 1;
+            if fill_flags(flags) != flags {
+                diff_stats.skipped_noncanonical_flags += 1;
+            } else if let Some(harness) = core_runtime.as_mut() {
+                let supported_flags = harness.supported_flags_mask();
+                if flags & !supported_flags != 0 {
+                    diff_stats.skipped_unsupported_flags += 1;
+                } else if flags & VERIFY_TAPROOT != 0 && !harness.has_spent_outputs_api() {
+                    diff_stats.skipped_taproot_without_spent_outputs_api += 1;
+                } else {
+                    let core_spent_slice = core_utxo_storage.as_deref();
+                    let ours_ok = result.is_ok();
+                    let core = harness
+                        .verify(
+                            script_pubkey.as_bytes(),
+                            amount,
+                            &tx_bytes,
+                            core_spent_slice,
+                            0,
+                            flags,
+                        )
+                        .unwrap_or_else(|err| {
+                            panic!("vector #{index} core runtime call failed: {err}")
+                        });
+                    assert!(
+                        ours_ok == core.ok,
+                        "vector #{index} diverged between Rust and Core runtime backend={} (scriptSig=`{script_sig_str}`, scriptPubKey=`{script_pubkey_str}`, flags={flags_str}, core_ok={}, core_err={})",
+                        harness.backend_label(),
+                        core.ok,
+                        core.err_code,
+                    );
+                    if harness.is_helper_backend() {
+                        diff_stats.helper_differential_vectors += 1;
+                    } else {
+                        diff_stats.legacy_differential_vectors += 1;
+                    }
+                }
+            } else if flags & !LEGACY_LIBCONSENSUS_SUPPORTED_FLAGS == 0 {
                 let ours_ok = result.is_ok();
+                let lib_utxo_storage: Option<Vec<bitcoinconsensus::Utxo>> =
+                    if flags & VERIFY_TAPROOT != 0 {
+                        script_storage.as_ref().map(|storage| {
+                            vec![bitcoinconsensus::Utxo {
+                                script_pubkey: storage.as_ptr(),
+                                script_pubkey_len: storage.len() as u32,
+                                value: amount as i64,
+                            }]
+                        })
+                    } else {
+                        None
+                    };
                 let core_res = bitcoinconsensus::verify_with_flags(
                     script_pubkey.as_bytes(),
                     amount,
                     &tx_bytes,
-                    core_spent_slice,
+                    lib_utxo_storage.as_deref(),
                     0,
                     flags,
                 );
@@ -154,6 +241,9 @@ fn bitcoin_core_script_vectors() {
                     ours_ok == core_ok,
                     "vector #{index} diverged between Rust and libbitcoinconsensus (scriptSig=`{script_sig_str}`, scriptPubKey=`{script_pubkey_str}`, flags={flags_str}, core_result={core_res:?})"
                 );
+                diff_stats.legacy_differential_vectors += 1;
+            } else {
+                diff_stats.skipped_unsupported_flags += 1;
             }
         }
 
@@ -181,6 +271,67 @@ fn bitcoin_core_script_vectors() {
         skipped == 0,
         "skipped {skipped} vectors due to unsupported flag combos"
     );
+
+    #[cfg(feature = "core-diff")]
+    {
+        let total_differential =
+            diff_stats.helper_differential_vectors + diff_stats.legacy_differential_vectors;
+        assert!(
+            total_differential > 0,
+            "script_vectors executed no differential checks"
+        );
+        if strict_helper {
+            assert!(
+                diff_stats.helper_differential_vectors > 0,
+                "strict helper profile expected helper-backed script vector comparisons",
+            );
+            assert_eq!(
+                diff_stats.legacy_differential_vectors, 0,
+                "strict helper profile must not fall back to legacy differential",
+            );
+            let mut accepted = BTreeMap::new();
+            if let Ok(raw) = env::var("CORE_CPP_DIFF_ACCEPTED_SKIPS") {
+                for token in raw
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|token| !token.is_empty())
+                {
+                    accepted.insert(token.to_string(), ());
+                }
+            }
+            let mut unaccepted = Vec::new();
+            for (reason, count) in [
+                ("noncanonical_flags", diff_stats.skipped_noncanonical_flags),
+                ("unsupported_flags", diff_stats.skipped_unsupported_flags),
+                (
+                    "taproot_without_spent_outputs_api",
+                    diff_stats.skipped_taproot_without_spent_outputs_api,
+                ),
+            ] {
+                if count == 0 {
+                    continue;
+                }
+                if !accepted.contains_key(reason) {
+                    unaccepted.push((reason, count));
+                }
+            }
+            assert!(
+                unaccepted.is_empty(),
+                "strict helper profile observed unaccepted skip reasons: {:?}; set CORE_CPP_DIFF_ACCEPTED_SKIPS=<comma-separated-reasons>",
+                unaccepted
+            );
+        }
+        println!(
+            "script_vectors core-diff coverage: backend={} total_vectors={} helper_differential={} legacy_differential={} skipped_noncanonical={} skipped_unsupported={} skipped_taproot_no_spent_outputs={}",
+            backend_label,
+            diff_stats.total_vectors,
+            diff_stats.helper_differential_vectors,
+            diff_stats.legacy_differential_vectors,
+            diff_stats.skipped_noncanonical_flags,
+            diff_stats.skipped_unsupported_flags,
+            diff_stats.skipped_taproot_without_spent_outputs_api,
+        );
+    }
 }
 
 fn panic_parse(index: usize, err: ParseScriptError, asm: &str) -> ! {
@@ -275,6 +426,18 @@ fn parse_flags(raw: &str) -> Result<u32, FlagError> {
         bits |= bit;
     }
     Ok(bits)
+}
+
+#[cfg(feature = "core-diff")]
+fn fill_flags(flags: u32) -> u32 {
+    let mut out = flags;
+    if out & VERIFY_CLEANSTACK != 0 {
+        out |= VERIFY_WITNESS;
+    }
+    if out & VERIFY_WITNESS != 0 {
+        out |= VERIFY_P2SH;
+    }
+    out
 }
 
 #[derive(Debug)]

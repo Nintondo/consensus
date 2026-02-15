@@ -81,7 +81,14 @@ fn assert_verify_matches_core(
     flags: u32,
 ) -> Result<(), ScriptFailure> {
     let tx_bytes = btc_consensus::serialize(tx);
-    let ours = verify_with_flags_detailed(spent_script.as_bytes(), amount_sat, &tx_bytes, None, 0, flags);
+    let ours = verify_with_flags_detailed(
+        spent_script.as_bytes(),
+        amount_sat,
+        &tx_bytes,
+        None,
+        0,
+        flags,
+    );
 
     #[cfg(feature = "core-diff")]
     {
@@ -96,8 +103,15 @@ fn assert_verify_matches_core(
         let ours_diff = if diff_flags == flags {
             ours.is_ok()
         } else {
-            verify_with_flags_detailed(spent_script.as_bytes(), amount_sat, &tx_bytes, None, 0, diff_flags)
-                .is_ok()
+            verify_with_flags_detailed(
+                spent_script.as_bytes(),
+                amount_sat,
+                &tx_bytes,
+                None,
+                0,
+                diff_flags,
+            )
+            .is_ok()
         };
         let core = bitcoinconsensus::verify_with_flags(
             spent_script.as_bytes(),
@@ -213,12 +227,9 @@ fn core_script_tests_script_checkmultisig23_parity() {
     let mut tx_to = build_spending_tx(&tx_from, 1);
     let amount_sat = tx_from.output[0].value.to_sat();
 
-    for keys in [
-        vec![key1, key2],
-        vec![key1, key3],
-        vec![key2, key3],
-    ] {
-        tx_to.input[0].script_sig = sign_legacy_multisig_input(&secp, &tx_to, &script_pubkey, &keys);
+    for keys in [vec![key1, key2], vec![key1, key3], vec![key2, key3]] {
+        tx_to.input[0].script_sig =
+            sign_legacy_multisig_input(&secp, &tx_to, &script_pubkey, &keys);
         assert_verify_matches_core(&script_pubkey, amount_sat, &tx_to, CORE_SCRIPT_TEST_FLAGS)
             .expect("valid 2-of-3 signature pair should pass");
     }
@@ -230,14 +241,17 @@ fn core_script_tests_script_checkmultisig23_parity() {
         vec![key4, key2], // key mismatch
         vec![key1, key4], // key mismatch
     ] {
-        tx_to.input[0].script_sig = sign_legacy_multisig_input(&secp, &tx_to, &script_pubkey, &keys);
-        let failure = assert_verify_matches_core(&script_pubkey, amount_sat, &tx_to, CORE_SCRIPT_TEST_FLAGS)
-            .expect_err("invalid signature set should fail");
+        tx_to.input[0].script_sig =
+            sign_legacy_multisig_input(&secp, &tx_to, &script_pubkey, &keys);
+        let failure =
+            assert_verify_matches_core(&script_pubkey, amount_sat, &tx_to, CORE_SCRIPT_TEST_FLAGS)
+                .expect_err("invalid signature set should fail");
         assert_eq!(failure.script_error, ScriptError::EvalFalse);
     }
 
     tx_to.input[0].script_sig = sign_legacy_multisig_input(&secp, &tx_to, &script_pubkey, &[]);
-    let no_sigs = assert_verify_matches_core(&script_pubkey, amount_sat, &tx_to, CORE_SCRIPT_TEST_FLAGS)
-        .expect_err("empty signature set should fail with stack underflow");
+    let no_sigs =
+        assert_verify_matches_core(&script_pubkey, amount_sat, &tx_to, CORE_SCRIPT_TEST_FLAGS)
+            .expect_err("empty signature set should fail with stack underflow");
     assert_eq!(no_sigs.script_error, ScriptError::InvalidStackOperation);
 }

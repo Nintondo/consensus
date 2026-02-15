@@ -376,3 +376,167 @@ Verification criteria:
 - [x] Generated large script-assets corpus is integrated, hash-pinned, and exercised in parity profile.
 - [x] Direct C++ runtime differential harness runs successfully with zero untriaged mismatches.
 - [x] Roadmap and README parity notes are updated with final coverage numbers and residual accepted caveats (if any).
+
+---
+
+## Phase 6 – Full Runtime Parity Closure (Open)
+
+Status:
+- Planned. This phase closes the remaining parity-proof gaps identified in the latest deep audit.
+- Goal: eliminate residual blind spots so parity claims are backed by direct C++ runtime differential coverage across the full relevant flag and API surface.
+
+### Open Findings (Severity Ranked)
+
+1. **High: direct Core-runtime differential still skips large flag surface as `unsupported_flags`.**
+   - Current harness constrains checks to a subset (`P2SH`, `DERSIG`, `NULLDUMMY`, `CLTV`, `CSV`, `WITNESS`, `TAPROOT`) instead of the full supported ScriptVerify set.
+   - Latest strict run snapshot:
+     - `compared_inputs=488`
+     - `skipped_unsupported_flags=989`
+   - Impact: many vectors that exercise policy/extended flags are not directly C++-differenced yet.
+
+2. **High: potential API-semantics divergence on `amount` vs `spent_outputs` precedence.**
+   - Current Rust path derives amount from `spent_outputs` when present (`src/lib.rs`), while Core runtime checker semantics are driven by the explicit amount argument in signature checks.
+   - Impact: caller inputs that are internally inconsistent can produce behavior differences.
+   - Scope: API-parity surface divergence risk, not a demonstrated chain-consensus divergence under canonical callers.
+
+3. **Medium: potential API-semantics divergence from unconditional TAPROOT->prevouts requirement.**
+   - Current Rust path rejects early when `VERIFY_TAPROOT` is set and no prevouts are provided.
+   - Core runtime requires taproot precomputed/prevout data contextually when the taproot checksig path is actually exercised.
+   - Impact: non-taproot execution paths under TAPROOT bit can diverge.
+
+4. **Medium: direct helper differential currently compares pass/fail only, not error-code parity.**
+   - Helper protocol already returns Core `ScriptError`, but harness assertion currently checks only boolean validity parity.
+   - Impact: classification mismatches can pass unnoticed even when final validity matches.
+
+5. **Medium: subset-only differential remains in additional suites.**
+   - `core_tx_vectors`, `script_vectors`, and `random_consistency` still rely primarily on libconsensus-subset differential behavior in parts of coverage.
+   - Impact: proof surface is split; full-flag parity is not uniformly asserted through direct Core runtime across suites.
+
+6. **Low: script-assets coverage still depends on curated+derived corpora, not full upstream minimizer artifact by default.**
+   - Curated fixture remains intentionally tiny (`tests/data/script_assets_test.json`), and generated coverage is derived from tx corpora.
+   - Impact: strong coverage exists, but still not equivalent to running the full minimizer-produced corpus artifact by default.
+
+### Workstreams
+
+#### L. Expand Direct C++ Runtime Differential to Full Supported Flag Surface
+- [x] Replace helper-backend subset gating with full parse+execution for all known ScriptVerify tokens supported by this crate/Core.
+- [x] Keep legacy `libbitcoinconsensus` backend fallback behavior isolated, but do not let it cap helper-backend coverage.
+- [x] Add per-flag and per-token coverage counters in helper differential output.
+- [x] Make `unsupported_flags` a hard failure in strict parity profile when helper backend is active.
+
+Verification criteria:
+- [x] `cargo test --features core-diff --test core_cpp_runtime_diff -- --nocapture` reports `skipped_unsupported_flags=0` in helper mode.
+- [x] Strict run with large limits passes without accepted `unsupported_flags` skips:
+  - `BITCOIN_CORE_REPO=/path/to/bitcoin CORE_CPP_DIFF_BUILD_HELPER=1 CORE_CPP_DIFF_REQUIRED=1 CORE_CPP_DIFF_STRICT=1 CORE_CPP_DIFF_ACCEPTED_SKIPS=noncanonical_flags,placeholder_vectors CORE_CPP_DIFF_SCRIPT_LIMIT=100000 CORE_CPP_DIFF_TX_LIMIT=100000 cargo test --features core-diff --test core_cpp_runtime_diff -- --nocapture`
+  - Current snapshot (helper backend): `supported_flags_mask=0x1fffff`, `compared_inputs=1485`, `script_vectors=1205`, `tx_valid_vectors=120`, `tx_invalid_vectors=84`, `targeted_cases=6`, `skipped_unsupported_flags=0`.
+
+#### M. Resolve Amount/Prevouts API Semantics to Core
+- [x] Define and document one compatibility contract:
+  - [x] Core-runtime parity contract selected: explicit `amount` is authoritative for signature-hash/checksig semantics.
+  - [x] No intentional divergence retained for this surface.
+- [x] Remove amount-override behavior; keep structural prevout script consistency checks.
+- [x] Add targeted regression+differential cases for inconsistent `(amount, spent_outputs)` inputs:
+  - [x] same script/tx with differing explicit amount vs prevout amount
+  - [x] witness-v0 checksig path coverage
+  - [x] taproot key/script path coverage (closed via Phase N taproot-prevouts semantic alignment and targeted helper differentials)
+- [x] Assert pass/fail parity versus helper backend for the new targeted case.
+
+Verification criteria:
+- [x] New targeted tests exist and are linked to this finding.
+  - `src/lib.rs`: `witness_uses_explicit_amount_even_with_spent_outputs`
+  - `tests/core_cpp_runtime_diff.rs`: targeted witness-v0 amount-precedence differential case
+- [x] Helper differential targeted cases show no mismatches for inconsistent-input scenarios.
+  - Current strict snapshot includes the amount-precedence targeted case with zero mismatches.
+
+#### N. Resolve TAPROOT Prevouts Requirement Semantics to Core
+- [x] Move spent-output requirement to the same semantic point Core requires it (taproot signature-hash evaluation path), not an unconditional flag-entry guard.
+- [x] Keep taproot readiness checks and fallback/error mapping aligned with current Core interpreter behavior.
+- [x] Add targeted differential vectors:
+  - [x] TAPROOT flag on non-witness/non-taproot script path with no prevouts
+  - [x] TAPROOT flag + witness payload that does not enter taproot signature path
+  - [x] actual taproot key/script signature path without prevouts (must fail consistently)
+
+Verification criteria:
+- [x] Targeted helper differential tests pass for all above scenarios.
+- [x] No early-reject mismatch remains for TAPROOT-bit-only non-taproot execution paths.
+- [x] Current strict snapshot (helper backend): `targeted_cases=6`, `skipped_unsupported_flags=0`, zero mismatches.
+
+#### O. Add ScriptError Classification Parity to Direct Helper Differential
+- [x] Extend `core_cpp_runtime_diff` assertions from boolean parity to full `(pass/fail + script error)` parity.
+- [x] Add explicit **complete** mapping table between Core `ScriptError` integer values and crate `ScriptError` (all currently exposed Core enum values).
+- [x] Treat any helper-returned `ScriptError` integer without a mapping as a strict-run failure.
+- [x] Track and print:
+  - mapped comparisons
+  - unmapped comparisons
+  - error-class mismatches
+- [x] Gate strict parity profile on:
+  - `unmapped_comparisons=0`
+  - `error_class_mismatches=0`
+
+Verification criteria:
+- [x] Strict helper run reports both `unmapped_comparisons=0` and `error_class_mismatches=0`.
+- [x] All compared failing cases assert equal error classes across Rust and Core helper.
+- [x] Current strict snapshot (helper backend):
+  - `compared_inputs=1485`
+  - `mapped_error_class_comparisons=1485`
+  - `unmapped_error_class_comparisons=0`
+  - `error_class_mismatches=0`
+
+#### P. Unify Full-Flag Differential Across `core_tx_vectors`, `script_vectors`, and `random_consistency`
+- [x] Add optional helper-backend differential path in each suite, preferring helper when available.
+- [x] Ensure no silent fallback to subset-only differential in parity profile.
+- [x] Keep explicit skip accounting by reason and fail if unexpected skip classes appear.
+- [x] Add parity-profile command(s) that run all three suites with helper-required mode.
+
+Verification criteria:
+- [x] `core_tx_vectors`, `script_vectors`, and `random_consistency` each report helper-backed differential execution counts.
+- [x] Parity profile fails if helper is unavailable or if comparisons are silently reduced to subset-only mode.
+- [x] Current strict helper snapshot:
+  - `core_tx_vectors`: `helper_differential=84` (tx-invalid) and `helper_differential=120` (tx-valid), `legacy_differential=0`
+  - `script_vectors`: `helper_differential=1209`, `legacy_differential=0`, `skipped_noncanonical=3`
+  - `random_consistency`: `helper_differential=256`, `legacy_differential=0`
+  - `noncanonical_flags` skip rationale: helper-backed differential intentionally skips non-canonical flag combinations (for example `CLEANSTACK` without `WITNESS`) because current Core `VerifyScript` asserts these invariants in debug builds (`src/script/interpreter.cpp:2098-2099`), which would abort the helper process instead of returning a script result.
+  - command:
+    - `BITCOIN_CORE_REPO=/path/to/bitcoin CORE_CPP_DIFF_BUILD_HELPER=1 CORE_CPP_DIFF_STRICT=1 CORE_CPP_DIFF_ACCEPTED_SKIPS=noncanonical_flags cargo test --features core-diff --test core_tx_vectors --test script_vectors --test random_consistency -- --nocapture`
+
+#### Q. Script-Assets Corpus Uplift to Upstream Minimizer Artifact
+- [x] Add support for consuming a full minimizer-generated `script_assets_test.json` artifact when provided by CI/local environment.
+  - `tests/script_assets.rs` now supports:
+    - `SCRIPT_ASSETS_UPSTREAM_JSON=/path/to/script_assets_test.json`
+    - optional `SCRIPT_ASSETS_USE_DIR_UNIT_TEST_DATA=1` fallback to `DIR_UNIT_TEST_DATA/script_assets_test.json`
+- [x] Keep curated fixture as smoke-only baseline, but make large corpus mandatory in parity profile.
+  - Curated smoke remains `tests/data/script_assets_test.json` (or `SCRIPT_ASSETS_CURATED_JSON`).
+  - Large corpus test enforces `SCRIPT_ASSETS_MIN_CASES` (default `200`) and parity-profile toggles:
+    - `SCRIPT_ASSETS_PARITY_PROFILE=1`
+    - `SCRIPT_ASSETS_REQUIRE_UPSTREAM=1` to require minimizer artifact source.
+- [x] Add metadata and integrity checks (hash + source provenance) for loaded large artifact.
+  - Derived corpus integrity remains hash-pinned via `tests/data/script_assets_generated_metadata.json`.
+  - Upstream minimizer corpus integrity requires metadata (`SCRIPT_ASSETS_UPSTREAM_METADATA_JSON` or sibling `script_assets_test.metadata.json`) with:
+    - `source_core_commit`
+    - `source_generation`
+    - `artifact_case_count`
+    - `artifact_sha256`
+- [x] Report case counts and skip reasons separately for curated, derived, and upstream-generated sources.
+  - Source-specific coverage summaries now print for:
+    - curated smoke
+    - derived-from-core-vectors (with explicit generation skip counters)
+    - upstream minimizer / derived external files.
+- [x] Emit deterministic long-run progress for large corpus sweeps.
+  - `script_assets_generated_corpus_monotonicity` now prints start/progress/complete checkpoints.
+  - `SCRIPT_ASSETS_PROGRESS_EVERY` controls checkpoint interval (default `100`, set `0` to suppress periodic checkpoints).
+
+Verification criteria:
+- [x] Parity profile runs large script-assets corpus and enforces a minimum-case threshold above curated/derived smoke levels.
+- [x] Integrity test fails on corpus drift and passes on exact expected artifact.
+
+### Phase 6 Exit Gates
+- [x] Direct helper differential runs with `skipped_unsupported_flags=0` and zero untriaged mismatches.
+- [x] Amount/prevouts and TAPROOT-prevouts semantics are either Core-aligned and tested, or explicitly documented as intentional divergence (with dedicated compatibility note).
+- [x] Error-code parity is asserted in helper differential for mapped cases with zero mismatches.
+- [x] `core_tx_vectors`, `script_vectors`, and `random_consistency` parity profile all run helper-backed differential checks.
+- [x] Large script-assets corpus (upstream minimizer artifact) is executed in parity profile with integrity pinning.
+  - CI wiring is implemented in `.github/workflows/core-parity.yml` and enforces `SCRIPT_ASSETS_REQUIRE_UPSTREAM=1`.
+  - Committed fallback artifacts are present: `tests/data/script_assets_upstream.json` and `tests/data/script_assets_upstream_metadata.json` (source generation: `script_assets_test_minimizer`).
+  - Known case-`#116` mismatch (`flags=0x20e15`) was fixed by aligning tapscript CHECKSIG/CHECKSIGADD semantics with Core (non-empty invalid Schnorr signatures now hard-fail instead of returning soft-false) and covered by regression test `script::tests::tapscript_non_empty_invalid_signature_aborts_checksigadd`.
+- [x] Roadmap + README parity claims updated with post-Phase-6 measured coverage metrics.
+  - README now includes a dated parity snapshot section with strict helper differential counters and upstream script-assets corpus execution metrics.

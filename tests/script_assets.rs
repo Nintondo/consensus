@@ -1,7 +1,7 @@
 mod script_asm;
 
-use bitcoin::{consensus as btc_consensus, hex::FromHex, ScriptBuf, Transaction, TxOut, Witness};
 use bitcoin::hashes::{sha256, Hash};
+use bitcoin::{consensus as btc_consensus, hex::FromHex, ScriptBuf, Transaction, TxOut, Witness};
 use consensus::{
     verify_with_flags_detailed, Utxo, VERIFY_CHECKLOCKTIMEVERIFY, VERIFY_CHECKSEQUENCEVERIFY,
     VERIFY_CLEANSTACK, VERIFY_CONST_SCRIPTCODE, VERIFY_DERSIG, VERIFY_DISCOURAGE_OP_SUCCESS,
@@ -16,7 +16,9 @@ use serde_json::{json, Value};
 use std::{
     collections::BTreeMap,
     env, fs,
+    io::{self, Write},
     path::{Path, PathBuf},
+    time::Instant,
 };
 
 const CORE_TX_VALID: &str = include_str!("data/tx_valid.json");
@@ -49,15 +51,39 @@ const ALL_TX_VECTOR_FLAGS: u32 = VERIFY_P2SH
     | VERIFY_DISCOURAGE_UPGRADABLE_PUBKEYTYPE
     | VERIFY_DISCOURAGE_OP_SUCCESS
     | VERIFY_DISCOURAGE_UPGRADABLE_TAPROOT_VERSION;
+const DEFAULT_PARITY_MIN_LARGE_CASES: usize = 200;
+const UPSTREAM_MINIMIZER_DEFAULT_NAME: &str = "script_assets_test.json";
+const UPSTREAM_MINIMIZER_METADATA_DEFAULT_NAME: &str = "script_assets_test.metadata.json";
+const GENERATED_ARTIFACT_METADATA_DEFAULT_NAME: &str = "script_assets_generated_metadata.json";
 
 fn curated_asset_path() -> PathBuf {
+    if let Ok(path) = env::var("SCRIPT_ASSETS_CURATED_JSON") {
+        return PathBuf::from(path);
+    }
+    // Legacy alias kept for compatibility with older local workflows.
     if let Ok(path) = env::var("SCRIPT_ASSETS_TEST_JSON") {
         return PathBuf::from(path);
     }
-    if let Ok(dir) = env::var("DIR_UNIT_TEST_DATA") {
-        return PathBuf::from(dir).join("script_assets_test.json");
-    }
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/data/script_assets_test.json")
+}
+
+fn upstream_minimizer_asset_path() -> Option<PathBuf> {
+    if let Ok(path) = env::var("SCRIPT_ASSETS_UPSTREAM_JSON") {
+        return Some(PathBuf::from(path));
+    }
+    let allow_dir_lookup = env::var("SCRIPT_ASSETS_USE_DIR_UNIT_TEST_DATA")
+        .ok()
+        .as_deref()
+        == Some("1");
+    if allow_dir_lookup {
+        if let Ok(dir) = env::var("DIR_UNIT_TEST_DATA") {
+            let candidate = PathBuf::from(dir).join(UPSTREAM_MINIMIZER_DEFAULT_NAME);
+            if candidate.exists() {
+                return Some(candidate);
+            }
+        }
+    }
+    None
 }
 
 fn generated_asset_path() -> Option<PathBuf> {
@@ -70,7 +96,8 @@ fn generated_asset_path() -> Option<PathBuf> {
             return Some(candidate);
         }
     }
-    let vendored = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/data/script_assets_generated.json");
+    let vendored =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/data/script_assets_generated.json");
     if vendored.exists() {
         return Some(vendored);
     }
@@ -81,7 +108,54 @@ fn generated_metadata_path() -> PathBuf {
     if let Ok(path) = env::var("SCRIPT_ASSETS_GENERATED_METADATA_JSON") {
         return PathBuf::from(path);
     }
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/data/script_assets_generated_metadata.json")
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/data")
+        .join(GENERATED_ARTIFACT_METADATA_DEFAULT_NAME)
+}
+
+fn upstream_metadata_path(upstream_path: &Path) -> Option<PathBuf> {
+    if let Ok(path) = env::var("SCRIPT_ASSETS_UPSTREAM_METADATA_JSON") {
+        return Some(PathBuf::from(path));
+    }
+    let sibling = upstream_path
+        .parent()
+        .map(|dir| dir.join(UPSTREAM_MINIMIZER_METADATA_DEFAULT_NAME));
+    match sibling {
+        Some(path) if path.exists() => Some(path),
+        _ => None,
+    }
+}
+
+fn script_assets_parity_profile_enabled() -> bool {
+    env::var("SCRIPT_ASSETS_PARITY_PROFILE")
+        .ok()
+        .as_deref()
+        .is_some_and(|value| value == "1")
+        || env::var("CORE_CPP_DIFF_STRICT")
+            .ok()
+            .as_deref()
+            .is_some_and(|value| value == "1")
+}
+
+fn script_assets_require_upstream_corpus() -> bool {
+    env::var("SCRIPT_ASSETS_REQUIRE_UPSTREAM")
+        .ok()
+        .as_deref()
+        .is_some_and(|value| value == "1")
+}
+
+fn parity_min_large_cases() -> usize {
+    env::var("SCRIPT_ASSETS_MIN_CASES")
+        .ok()
+        .and_then(|raw| raw.parse::<usize>().ok())
+        .unwrap_or(DEFAULT_PARITY_MIN_LARGE_CASES)
+}
+
+fn script_assets_progress_every() -> usize {
+    env::var("SCRIPT_ASSETS_PROGRESS_EVERY")
+        .ok()
+        .and_then(|raw| raw.parse::<usize>().ok())
+        .unwrap_or(100)
 }
 
 fn all_consensus_flags() -> Vec<u32> {
@@ -180,9 +254,10 @@ enum TxVectorSkipReason {
 }
 
 #[derive(Debug)]
-enum GeneratedCorpusSource {
-    BuiltFromCoreVectors,
-    ExternalFile(PathBuf),
+enum LargeCorpusSource {
+    UpstreamMinimizer(PathBuf),
+    DerivedExternalFile(PathBuf),
+    DerivedFromCoreVectors,
 }
 
 #[derive(Default)]
@@ -204,6 +279,13 @@ struct GeneratedCorpusMetadata {
     source_tx_invalid_sha256: String,
     generated_case_count: usize,
     generated_sha256: String,
+}
+
+struct UpstreamCorpusMetadata {
+    source_core_commit: String,
+    source_generation: String,
+    artifact_case_count: usize,
+    artifact_sha256: String,
 }
 
 #[derive(Default)]
@@ -319,8 +401,12 @@ fn hash_json_entries(entries: &[Value]) -> String {
 }
 
 fn parse_generated_corpus_metadata(path: &Path) -> GeneratedCorpusMetadata {
-    let raw = fs::read_to_string(path)
-        .unwrap_or_else(|err| panic!("failed to read generated metadata {}: {err}", path.display()));
+    let raw = fs::read_to_string(path).unwrap_or_else(|err| {
+        panic!(
+            "failed to read generated metadata {}: {err}",
+            path.display()
+        )
+    });
     let value: Value = serde_json::from_str(&raw)
         .unwrap_or_else(|err| panic!("invalid generated metadata JSON {}: {err}", path.display()));
     let obj = value
@@ -340,27 +426,103 @@ fn parse_generated_corpus_metadata(path: &Path) -> GeneratedCorpusMetadata {
         source_core_commit: obj
             .get("source_core_commit")
             .and_then(Value::as_str)
-            .unwrap_or_else(|| panic!("generated metadata {} missing source_core_commit", path.display()))
+            .unwrap_or_else(|| {
+                panic!(
+                    "generated metadata {} missing source_core_commit",
+                    path.display()
+                )
+            })
             .to_string(),
         source_tx_valid_sha256: source
             .get("tx_valid_sha256")
             .and_then(Value::as_str)
-            .unwrap_or_else(|| panic!("generated metadata {} missing tx_valid_sha256", path.display()))
+            .unwrap_or_else(|| {
+                panic!(
+                    "generated metadata {} missing tx_valid_sha256",
+                    path.display()
+                )
+            })
             .to_string(),
         source_tx_invalid_sha256: source
             .get("tx_invalid_sha256")
             .and_then(Value::as_str)
-            .unwrap_or_else(|| panic!("generated metadata {} missing tx_invalid_sha256", path.display()))
+            .unwrap_or_else(|| {
+                panic!(
+                    "generated metadata {} missing tx_invalid_sha256",
+                    path.display()
+                )
+            })
             .to_string(),
         generated_case_count: obj
             .get("generated_case_count")
             .and_then(Value::as_u64)
-            .unwrap_or_else(|| panic!("generated metadata {} missing generated_case_count", path.display()))
-            as usize,
+            .unwrap_or_else(|| {
+                panic!(
+                    "generated metadata {} missing generated_case_count",
+                    path.display()
+                )
+            }) as usize,
         generated_sha256: obj
             .get("generated_sha256")
             .and_then(Value::as_str)
-            .unwrap_or_else(|| panic!("generated metadata {} missing generated_sha256", path.display()))
+            .unwrap_or_else(|| {
+                panic!(
+                    "generated metadata {} missing generated_sha256",
+                    path.display()
+                )
+            })
+            .to_string(),
+    }
+}
+
+fn parse_upstream_corpus_metadata(path: &Path) -> UpstreamCorpusMetadata {
+    let raw = fs::read_to_string(path)
+        .unwrap_or_else(|err| panic!("failed to read upstream metadata {}: {err}", path.display()));
+    let value: Value = serde_json::from_str(&raw)
+        .unwrap_or_else(|err| panic!("invalid upstream metadata JSON {}: {err}", path.display()));
+    let obj = value
+        .as_object()
+        .unwrap_or_else(|| panic!("upstream metadata {} must be an object", path.display()));
+
+    UpstreamCorpusMetadata {
+        source_core_commit: obj
+            .get("source_core_commit")
+            .and_then(Value::as_str)
+            .unwrap_or_else(|| {
+                panic!(
+                    "upstream metadata {} missing source_core_commit",
+                    path.display()
+                )
+            })
+            .to_string(),
+        source_generation: obj
+            .get("source_generation")
+            .and_then(Value::as_str)
+            .unwrap_or_else(|| {
+                panic!(
+                    "upstream metadata {} missing source_generation",
+                    path.display()
+                )
+            })
+            .to_string(),
+        artifact_case_count: obj
+            .get("artifact_case_count")
+            .and_then(Value::as_u64)
+            .unwrap_or_else(|| {
+                panic!(
+                    "upstream metadata {} missing artifact_case_count",
+                    path.display()
+                )
+            }) as usize,
+        artifact_sha256: obj
+            .get("artifact_sha256")
+            .and_then(Value::as_str)
+            .unwrap_or_else(|| {
+                panic!(
+                    "upstream metadata {} missing artifact_sha256",
+                    path.display()
+                )
+            })
             .to_string(),
     }
 }
@@ -548,10 +710,18 @@ fn generate_script_assets_entries() -> (Vec<Value>, GeneratedCorpusStats) {
 }
 
 fn load_script_asset_entries(path: &Path) -> Vec<Value> {
-    let raw = fs::read_to_string(path)
-        .unwrap_or_else(|err| panic!("failed to read script assets file {}: {err}", path.display()));
-    let tests: Value = serde_json::from_str(&raw)
-        .unwrap_or_else(|err| panic!("failed to parse script assets JSON {}: {err}", path.display()));
+    let raw = fs::read_to_string(path).unwrap_or_else(|err| {
+        panic!(
+            "failed to read script assets file {}: {err}",
+            path.display()
+        )
+    });
+    let tests: Value = serde_json::from_str(&raw).unwrap_or_else(|err| {
+        panic!(
+            "failed to parse script assets JSON {}: {err}",
+            path.display()
+        )
+    });
     let entries = tests
         .as_array()
         .unwrap_or_else(|| panic!("script assets top-level JSON must be an array"));
@@ -563,13 +733,26 @@ fn load_script_asset_entries(path: &Path) -> Vec<Value> {
     entries.clone()
 }
 
-fn load_or_generate_large_script_assets_entries() -> (Vec<Value>, GeneratedCorpusSource, GeneratedCorpusStats) {
+fn load_or_generate_large_script_assets_entries(
+) -> (Vec<Value>, LargeCorpusSource, GeneratedCorpusStats) {
+    if let Some(path) = upstream_minimizer_asset_path() {
+        let entries = load_script_asset_entries(&path);
+        return (
+            entries,
+            LargeCorpusSource::UpstreamMinimizer(path),
+            GeneratedCorpusStats::default(),
+        );
+    }
     if let Some(path) = generated_asset_path() {
         let entries = load_script_asset_entries(&path);
-        return (entries, GeneratedCorpusSource::ExternalFile(path), GeneratedCorpusStats::default());
+        return (
+            entries,
+            LargeCorpusSource::DerivedExternalFile(path),
+            GeneratedCorpusStats::default(),
+        );
     }
     let (entries, stats) = generate_script_assets_entries();
-    (entries, GeneratedCorpusSource::BuiltFromCoreVectors, stats)
+    (entries, LargeCorpusSource::DerivedFromCoreVectors, stats)
 }
 
 fn verify_case(
@@ -768,6 +951,15 @@ fn parse_tx_vector_flags_rejects_unknown_tokens() {
 
 fn run_script_assets_entries_monotonicity(entries: &[Value], label: &str) {
     let consensus_flags = all_consensus_flags();
+    let total_cases = entries.len();
+    let progress_every = script_assets_progress_every();
+    let started = Instant::now();
+    println!(
+        "script_assets progress start: corpus=`{label}` cases={} progress_every={}",
+        total_cases, progress_every
+    );
+    let _ = io::stdout().flush();
+
     for (idx, case) in entries.iter().enumerate() {
         let obj = case
             .as_object()
@@ -867,11 +1059,210 @@ fn run_script_assets_entries_monotonicity(entries: &[Value], label: &str) {
                 }
             }
         }
+
+        let completed = idx + 1;
+        if progress_every > 0 && (completed % progress_every == 0 || completed == total_cases) {
+            let elapsed = started.elapsed().as_secs_f64();
+            let percent = (completed as f64 * 100.0) / total_cases as f64;
+            println!(
+                "script_assets progress: corpus=`{label}` completed={}/{} ({percent:.1}%) elapsed={elapsed:.2}s",
+                completed, total_cases
+            );
+            let _ = io::stdout().flush();
+        }
     }
 
     println!(
-        "script_assets corpus `{label}` monotonicity coverage: cases={}",
-        entries.len()
+        "script_assets corpus `{label}` monotonicity complete: cases={} elapsed={:.2}s",
+        entries.len(),
+        started.elapsed().as_secs_f64()
+    );
+}
+
+fn print_curated_summary(cases: usize, path: &Path) {
+    println!(
+        "script_assets source=curated-smoke path={} cases={} generation_skips=0",
+        path.display(),
+        cases
+    );
+}
+
+fn print_large_source_summary(
+    source: &LargeCorpusSource,
+    entries: usize,
+    stats: &GeneratedCorpusStats,
+) {
+    match source {
+        LargeCorpusSource::UpstreamMinimizer(path) => {
+            println!(
+                "script_assets source=upstream-minimizer path={} cases={} generation_skips=0",
+                path.display(),
+                entries
+            );
+        }
+        LargeCorpusSource::DerivedExternalFile(path) => {
+            println!(
+                "script_assets source=derived-external path={} cases={} generation_skips=0",
+                path.display(),
+                entries
+            );
+        }
+        LargeCorpusSource::DerivedFromCoreVectors => {
+            println!(
+                "script_assets source=derived-from-core-vectors cases={} vectors_total={} vectors_parsed={} success_cases={} failure_cases={} skipped_badtx={} skipped_unknown={} skipped_noncanonical={} skipped_incompatible_inputs={}",
+                entries,
+                stats.total_vectors,
+                stats.parsed_vectors,
+                stats.generated_success_cases,
+                stats.generated_failure_cases,
+                stats.skipped_badtx,
+                stats.skipped_unknown,
+                stats.skipped_noncanonical,
+                stats.skipped_incompatible_inputs
+            );
+        }
+    }
+}
+
+fn enforce_large_corpus_profile_requirements(source: &LargeCorpusSource, entries: &[Value]) {
+    if script_assets_parity_profile_enabled() {
+        let min_cases = parity_min_large_cases();
+        assert!(
+            entries.len() >= min_cases,
+            "large script-assets corpus is too small: {} cases (minimum required: {})",
+            entries.len(),
+            min_cases
+        );
+
+        if script_assets_require_upstream_corpus() {
+            assert!(
+                matches!(source, LargeCorpusSource::UpstreamMinimizer(_)),
+                "parity profile requires upstream minimizer corpus (set SCRIPT_ASSETS_UPSTREAM_JSON)"
+            );
+        }
+    } else {
+        assert!(
+            entries.len() > 50,
+            "large script-assets corpus is too small for non-parity run ({} cases)",
+            entries.len()
+        );
+    }
+}
+
+fn assert_generated_metadata_integrity_for_entries(entries: &[Value]) {
+    let metadata_path = generated_metadata_path();
+    assert!(
+        metadata_path.exists(),
+        "generated metadata file does not exist: {}",
+        metadata_path.display()
+    );
+    let metadata = parse_generated_corpus_metadata(&metadata_path);
+
+    let tx_valid_hash = sha256::Hash::hash(CORE_TX_VALID.as_bytes()).to_string();
+    let tx_invalid_hash = sha256::Hash::hash(CORE_TX_INVALID.as_bytes()).to_string();
+    assert_eq!(
+        metadata.source_tx_valid_sha256,
+        tx_valid_hash,
+        "generated metadata tx_valid hash mismatch in {}",
+        metadata_path.display()
+    );
+    assert_eq!(
+        metadata.source_tx_invalid_sha256,
+        tx_invalid_hash,
+        "generated metadata tx_invalid hash mismatch in {}",
+        metadata_path.display()
+    );
+    assert_eq!(
+        metadata.generated_case_count,
+        entries.len(),
+        "generated metadata case-count mismatch in {}",
+        metadata_path.display()
+    );
+    assert_eq!(
+        metadata.generated_sha256,
+        hash_json_entries(entries),
+        "generated metadata corpus hash mismatch in {}",
+        metadata_path.display()
+    );
+    assert!(
+        !metadata.source_core_commit.is_empty(),
+        "generated metadata source_core_commit must be non-empty"
+    );
+}
+
+fn assert_upstream_metadata_integrity_for_entries(path: &Path, entries: &[Value]) {
+    let metadata_path = upstream_metadata_path(path).unwrap_or_else(|| {
+        panic!(
+            "upstream script-assets corpus requires metadata file (set SCRIPT_ASSETS_UPSTREAM_METADATA_JSON or provide sibling {})",
+            UPSTREAM_MINIMIZER_METADATA_DEFAULT_NAME
+        )
+    });
+    assert!(
+        metadata_path.exists(),
+        "upstream metadata file does not exist: {}",
+        metadata_path.display()
+    );
+    let metadata = parse_upstream_corpus_metadata(&metadata_path);
+    assert!(
+        !metadata.source_core_commit.is_empty(),
+        "upstream metadata source_core_commit must be non-empty"
+    );
+    assert!(
+        !metadata.source_generation.is_empty(),
+        "upstream metadata source_generation must be non-empty"
+    );
+    assert_eq!(
+        metadata.artifact_case_count,
+        entries.len(),
+        "upstream metadata case-count mismatch in {}",
+        metadata_path.display()
+    );
+    assert_eq!(
+        metadata.artifact_sha256,
+        hash_json_entries(entries),
+        "upstream metadata corpus hash mismatch in {}",
+        metadata_path.display()
+    );
+}
+
+fn assert_large_corpus_integrity(source: &LargeCorpusSource, entries: &[Value]) {
+    match source {
+        LargeCorpusSource::UpstreamMinimizer(path) => {
+            assert_upstream_metadata_integrity_for_entries(path, entries);
+        }
+        LargeCorpusSource::DerivedExternalFile(_) | LargeCorpusSource::DerivedFromCoreVectors => {
+            // Derived corpus integrity is pinned to tx corpus fixtures and generated metadata.
+            assert_generated_metadata_integrity_for_entries(entries);
+        }
+    }
+}
+
+fn maybe_export_large_corpus_entries(entries: &[Value], source: &LargeCorpusSource) {
+    let Ok(path) = env::var("SCRIPT_ASSETS_WRITE_UPSTREAM_JSON") else {
+        return;
+    };
+    let output_path = PathBuf::from(path);
+    if let Some(parent) = output_path.parent() {
+        fs::create_dir_all(parent).unwrap_or_else(|err| {
+            panic!(
+                "failed to create parent directory for {}: {err}",
+                output_path.display()
+            )
+        });
+    }
+    let encoded =
+        serde_json::to_vec_pretty(entries).expect("script-assets upstream corpus serialization");
+    fs::write(&output_path, encoded).unwrap_or_else(|err| {
+        panic!(
+            "failed to write script-assets upstream corpus {}: {err}",
+            output_path.display()
+        )
+    });
+    println!(
+        "wrote script-assets upstream corpus to {} (cases={}, source={:?})",
+        output_path.display(),
+        entries.len(),
+        source
     );
 }
 
@@ -884,6 +1275,7 @@ fn script_assets_curated_smoke_monotonicity() {
         path.display()
     );
     let entries = load_script_asset_entries(&path);
+    print_curated_summary(entries.len(), &path);
     run_script_assets_entries_monotonicity(&entries, "curated-smoke");
 }
 
@@ -891,45 +1283,39 @@ fn script_assets_curated_smoke_monotonicity() {
 fn script_assets_generated_corpus_monotonicity() {
     let (entries, source, stats) = load_or_generate_large_script_assets_entries();
     let label = match &source {
-        GeneratedCorpusSource::BuiltFromCoreVectors => "generated-from-core-vectors".to_string(),
-        GeneratedCorpusSource::ExternalFile(path) => format!("external-generated-file:{}", path.display()),
+        LargeCorpusSource::UpstreamMinimizer(path) => {
+            format!("upstream-minimizer:{}", path.display())
+        }
+        LargeCorpusSource::DerivedExternalFile(path) => {
+            format!("derived-external-file:{}", path.display())
+        }
+        LargeCorpusSource::DerivedFromCoreVectors => "derived-from-core-vectors".to_string(),
     };
-    match source {
-        GeneratedCorpusSource::BuiltFromCoreVectors => {
+    match &source {
+        LargeCorpusSource::DerivedFromCoreVectors => {
             assert!(
                 stats.unknown_token_counts.is_empty(),
                 "generated corpus encountered unknown tx-vector flags: {:?}",
                 stats.unknown_token_counts
             );
-            assert!(
-                entries.len() > 50,
-                "generated script-assets corpus is too small ({} cases)",
-                entries.len()
-            );
-            println!(
-                "generated script_assets corpus stats: vectors_total={} vectors_parsed={} success_cases={} failure_cases={} skipped_badtx={} skipped_unknown={} skipped_noncanonical={} skipped_incompatible_inputs={}",
-                stats.total_vectors,
-                stats.parsed_vectors,
-                stats.generated_success_cases,
-                stats.generated_failure_cases,
-                stats.skipped_badtx,
-                stats.skipped_unknown,
-                stats.skipped_noncanonical,
-                stats.skipped_incompatible_inputs
-            );
         }
-        GeneratedCorpusSource::ExternalFile(_) => {
-            println!("using externally supplied generated script_assets corpus");
+        LargeCorpusSource::UpstreamMinimizer(_) => {}
+        LargeCorpusSource::DerivedExternalFile(_) => {
+            println!("using externally supplied derived script_assets corpus");
         }
     }
+    enforce_large_corpus_profile_requirements(&source, &entries);
+    assert_large_corpus_integrity(&source, &entries);
+    maybe_export_large_corpus_entries(&entries, &source);
+    print_large_source_summary(&source, entries.len(), &stats);
     run_script_assets_entries_monotonicity(&entries, &label);
 }
 
 #[test]
 fn script_assets_generated_metadata_integrity() {
-    if generated_asset_path().is_some() {
+    if generated_asset_path().is_some() || upstream_minimizer_asset_path().is_some() {
         eprintln!(
-            "skipping generated metadata integrity check (external SCRIPT_ASSETS_GENERATED_JSON supplied)"
+            "skipping derived metadata integrity check (external large script-assets corpus supplied)"
         );
         return;
     }
@@ -940,43 +1326,19 @@ fn script_assets_generated_metadata_integrity() {
         "generated corpus encountered unknown tx-vector flags: {:?}",
         stats.unknown_token_counts
     );
+    assert_generated_metadata_integrity_for_entries(&entries);
+}
 
-    let metadata_path = generated_metadata_path();
-    assert!(
-        metadata_path.exists(),
-        "generated metadata file does not exist: {}",
-        metadata_path.display()
-    );
-    let metadata = parse_generated_corpus_metadata(&metadata_path);
-
-    let tx_valid_hash = sha256::Hash::hash(CORE_TX_VALID.as_bytes()).to_string();
-    let tx_invalid_hash = sha256::Hash::hash(CORE_TX_INVALID.as_bytes()).to_string();
-    assert_eq!(
-        metadata.source_tx_valid_sha256, tx_valid_hash,
-        "generated metadata tx_valid hash mismatch in {}",
-        metadata_path.display()
-    );
-    assert_eq!(
-        metadata.source_tx_invalid_sha256, tx_invalid_hash,
-        "generated metadata tx_invalid hash mismatch in {}",
-        metadata_path.display()
-    );
-    assert_eq!(
-        metadata.generated_case_count,
-        entries.len(),
-        "generated metadata case-count mismatch in {}",
-        metadata_path.display()
-    );
-    assert_eq!(
-        metadata.generated_sha256,
-        hash_json_entries(&entries),
-        "generated metadata corpus hash mismatch in {}",
-        metadata_path.display()
-    );
-    assert!(
-        !metadata.source_core_commit.is_empty(),
-        "generated metadata source_core_commit must be non-empty"
-    );
+#[test]
+fn script_assets_upstream_metadata_integrity() {
+    let Some(path) = upstream_minimizer_asset_path() else {
+        eprintln!(
+            "skipping upstream metadata integrity check (set SCRIPT_ASSETS_UPSTREAM_JSON to enable)"
+        );
+        return;
+    };
+    let entries = load_script_asset_entries(&path);
+    assert_upstream_metadata_integrity_for_entries(&path, &entries);
 }
 
 #[test]
@@ -987,4 +1349,107 @@ fn script_assets_monotonicity_over_core_tx_valid_vectors() {
 #[test]
 fn script_assets_core_tx_invalid_exact_flag_failures() {
     run_core_tx_monotonicity(CORE_TX_INVALID, false);
+}
+
+#[test]
+fn script_assets_upstream_case_116_siglen_popbyte_csa_neg() {
+    let path =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/data/script_assets_upstream.json");
+    if !path.exists() {
+        eprintln!(
+            "skipping upstream case-116 regression (missing {})",
+            path.display()
+        );
+        return;
+    }
+
+    let entries = load_script_asset_entries(&path);
+    let case = entries
+        .get(116)
+        .unwrap_or_else(|| panic!("upstream corpus missing case #116 in {}", path.display()));
+    let obj = case
+        .as_object()
+        .unwrap_or_else(|| panic!("upstream case #116 must be an object"));
+
+    let tx_hex = obj
+        .get("tx")
+        .and_then(Value::as_str)
+        .unwrap_or_else(|| panic!("upstream case #116 missing tx"));
+    let tx_bytes =
+        Vec::from_hex(tx_hex).unwrap_or_else(|_| panic!("upstream case #116 has invalid tx hex"));
+    let mut tx = btc_consensus::deserialize::<Transaction>(&tx_bytes)
+        .unwrap_or_else(|_| panic!("upstream case #116 tx failed to deserialize"));
+
+    let prevouts = parse_prevouts(
+        obj.get("prevouts")
+            .unwrap_or_else(|| panic!("upstream case #116 missing prevouts")),
+    );
+    let input_index = obj
+        .get("index")
+        .and_then(Value::as_u64)
+        .unwrap_or_else(|| panic!("upstream case #116 missing index")) as usize;
+    assert_eq!(
+        input_index, 0,
+        "upstream case #116 index changed unexpectedly"
+    );
+    assert_eq!(
+        tx.input.len(),
+        prevouts.len(),
+        "upstream case #116 prevout count mismatch"
+    );
+    let flags = parse_flags(
+        obj.get("flags")
+            .and_then(Value::as_str)
+            .unwrap_or_else(|| panic!("upstream case #116 missing flags")),
+    );
+    assert_eq!(
+        flags, 0x20e15,
+        "upstream case #116 flags changed unexpectedly"
+    );
+
+    let success = obj
+        .get("success")
+        .and_then(Value::as_object)
+        .unwrap_or_else(|| panic!("upstream case #116 missing success branch"));
+    tx.input[input_index].script_sig = ScriptBuf::from_bytes(
+        Vec::from_hex(
+            success
+                .get("scriptSig")
+                .and_then(Value::as_str)
+                .unwrap_or_else(|| panic!("upstream case #116 success missing scriptSig")),
+        )
+        .unwrap_or_else(|_| panic!("upstream case #116 success scriptSig hex invalid")),
+    );
+    tx.input[input_index].witness = parse_witness(
+        success
+            .get("witness")
+            .unwrap_or_else(|| panic!("upstream case #116 success missing witness")),
+    );
+    let success_result = verify_case(&tx, &prevouts, input_index, flags);
+    assert!(
+        success_result.is_ok(),
+        "upstream case #116 success branch should pass, got {success_result:?}"
+    );
+
+    let failure = obj
+        .get("failure")
+        .and_then(Value::as_object)
+        .unwrap_or_else(|| panic!("upstream case #116 missing failure branch"));
+    tx.input[input_index].script_sig = ScriptBuf::from_bytes(
+        Vec::from_hex(
+            failure
+                .get("scriptSig")
+                .and_then(Value::as_str)
+                .unwrap_or_else(|| panic!("upstream case #116 failure missing scriptSig")),
+        )
+        .unwrap_or_else(|_| panic!("upstream case #116 failure scriptSig hex invalid")),
+    );
+    tx.input[input_index].witness = parse_witness(
+        failure
+            .get("witness")
+            .unwrap_or_else(|| panic!("upstream case #116 failure missing witness")),
+    );
+    let failure_result = verify_case(&tx, &prevouts, input_index, flags)
+        .expect_err("upstream case #116 failure branch must fail");
+    assert_eq!(failure_result.script_error, consensus::ScriptError::SchnorrSig);
 }
