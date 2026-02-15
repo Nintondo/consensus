@@ -1,6 +1,7 @@
 # GitHub CI Setup
 
 This repository includes `.github/workflows/core-parity.yml`, which runs parity checks on pull requests and `main`.
+The workflow installs Core helper build prerequisites via apt, including `libboost-dev` (required by current Bitcoin Core CMake configuration).
 
 ## Core Pinning
 

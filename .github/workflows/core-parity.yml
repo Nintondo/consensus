@@ -33,6 +33,7 @@ jobs:
             ninja-build \
             pkg-config \
             python3 \
+            libboost-dev \
             curl \
             ca-certificates
 
