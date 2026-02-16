@@ -96,6 +96,15 @@ std::optional<T> ParseIntegral(const std::string& s)
 
 std::string HandleRequest(const std::string& line)
 {
+    if (line == "META") {
+#ifdef NDEBUG
+        constexpr bool kAssertsEnabled = false;
+#else
+        constexpr bool kAssertsEnabled = true;
+#endif
+        return std::string("META|asserts=") + (kAssertsEnabled ? "1" : "0");
+    }
+
     // Request line format:
     // flags|input_index|amount_sat|script_pubkey_hex|tx_hex|spent_count|spent_outputs
     // spent_outputs format:

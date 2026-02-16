@@ -1,6 +1,6 @@
 # consensus
 
-Pure Rust implementation of Bitcoin's `libbitcoinconsensus` verification surface.
+Pure Rust implementation of Bitcoin's `bitcoinconsensus` verification surface (historically exposed as `libbitcoinconsensus`).
 
 ## Status
 

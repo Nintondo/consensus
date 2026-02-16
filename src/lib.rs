@@ -220,6 +220,13 @@ fn perform_verification(
     input_index: usize,
     flags: u32,
 ) -> Result<(), ScriptFailure> {
+    // Keep the public API contract explicit: unknown verification bits are
+    // rejected before transaction decoding/index checks.
+    let flags = ScriptFlags::from_bits(flags).map_err(|err| ScriptFailure {
+        error: err,
+        script_error: ScriptError::Ok,
+    })?;
+
     let tx_ctx = TransactionContext::parse(spending_transaction).map_err(|err| ScriptFailure {
         error: err,
         script_error: ScriptError::Ok,
@@ -230,11 +237,6 @@ fn perform_verification(
             error: err,
             script_error: ScriptError::Ok,
         })?;
-
-    let flags = ScriptFlags::from_bits(flags).map_err(|err| ScriptFailure {
-        error: err,
-        script_error: ScriptError::Ok,
-    })?;
     let spent_outputs = spent_outputs
         .map(|raw| SpentOutputs::new(tx_ctx.tx().input.len(), raw))
         .transpose()
@@ -361,6 +363,45 @@ mod tests {
         assert!(height_to_flags(419_328) & VERIFY_CHECKSEQUENCEVERIFY != 0);
         assert!(height_to_flags(481_824) & VERIFY_WITNESS != 0);
         assert!(height_to_flags(709_632) & VERIFY_TAPROOT != 0);
+    }
+
+    #[test]
+    fn verify_with_flags_rejects_unknown_bits_before_tx_deserialize() {
+        let invalid_flags = VERIFY_P2SH | (1u32 << 31);
+
+        let err =
+            verify_with_flags(&[], 0, &[], None, 0, invalid_flags).expect_err("invalid flags");
+        assert_eq!(err, Error::ERR_INVALID_FLAGS);
+
+        let failure = verify_with_flags_detailed(&[], 0, &[], None, 0, invalid_flags)
+            .expect_err("invalid flags");
+        assert_eq!(failure.error, Error::ERR_INVALID_FLAGS);
+        assert_eq!(failure.script_error, ScriptError::Ok);
+    }
+
+    #[test]
+    fn verify_with_flags_rejects_unknown_bits_before_tx_index_check() {
+        let invalid_flags = VERIFY_WITNESS | (1u32 << 31);
+        let tx = Transaction {
+            version: Version(2),
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint::default(),
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence::MAX,
+                witness: Witness::new(),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(0),
+                script_pubkey: ScriptBuf::new(),
+            }],
+        };
+        let tx_bytes = consensus::serialize(&tx);
+
+        let failure = verify_with_flags_detailed(&[], 0, &tx_bytes, None, 7, invalid_flags)
+            .expect_err("invalid flags");
+        assert_eq!(failure.error, Error::ERR_INVALID_FLAGS);
+        assert_eq!(failure.script_error, ScriptError::Ok);
     }
 
     #[test]

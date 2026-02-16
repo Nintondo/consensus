@@ -24,6 +24,9 @@ jobs:
       - name: Set up Rust toolchain
         uses: dtolnay/rust-toolchain@stable
 
+      - name: Clippy parity profile (core-diff)
+        run: cargo clippy --workspace --all-targets --features core-diff -- -D warnings
+
       - name: Install build dependencies
         run: |
           sudo apt-get update

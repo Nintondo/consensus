@@ -3189,7 +3189,7 @@ mod tests {
 
         let script = Vec::from_hex(TAPSCRIPT_HEX).expect("tapscript hex");
         let control = Vec::from_hex(CONTROL_BLOCK_HEX).expect("control hex");
-        let script_pubkey_storage = vec![prevout.script_pubkey.as_bytes().to_vec()];
+        let script_pubkey_storage = [prevout.script_pubkey.as_bytes().to_vec()];
         let utxos = vec![Utxo {
             script_pubkey: script_pubkey_storage[0].as_ptr(),
             script_pubkey_len: script_pubkey_storage[0].len() as u32,

@@ -1384,10 +1384,10 @@ fn script_assets_upstream_case_116_siglen_popbyte_csa_neg() {
         obj.get("prevouts")
             .unwrap_or_else(|| panic!("upstream case #116 missing prevouts")),
     );
-    let input_index = obj
-        .get("index")
-        .and_then(Value::as_u64)
-        .unwrap_or_else(|| panic!("upstream case #116 missing index")) as usize;
+    let input_index =
+        obj.get("index")
+            .and_then(Value::as_u64)
+            .unwrap_or_else(|| panic!("upstream case #116 missing index")) as usize;
     assert_eq!(
         input_index, 0,
         "upstream case #116 index changed unexpectedly"
@@ -1451,5 +1451,8 @@ fn script_assets_upstream_case_116_siglen_popbyte_csa_neg() {
     );
     let failure_result = verify_case(&tx, &prevouts, input_index, flags)
         .expect_err("upstream case #116 failure branch must fail");
-    assert_eq!(failure_result.script_error, consensus::ScriptError::SchnorrSig);
+    assert_eq!(
+        failure_result.script_error,
+        consensus::ScriptError::SchnorrSig
+    );
 }

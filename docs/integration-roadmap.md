@@ -2,6 +2,11 @@
 
 Goal: replicate the complete `libbitcoinconsensus` behavior in pure Rust while staying source-compatible with `rust-bitcoinconsensus`. Work proceeds in phases so we can ship incremental value and keep parity with Bitcoin Core.
 
+Current state snapshot (February 15, 2026):
+- Phases 0 through 6 are completed for the current parity scope.
+- No known open consensus/runtime parity mismatches remain against the pinned Core reference used by this repo.
+- Remaining work is ongoing maintenance for future upstream Core changes and corpus refresh cadence.
+
 ---
 
 ## Phase 0 – Baseline & Scaffolding ✅ Completed
@@ -16,33 +21,33 @@ Goal: replicate the complete `libbitcoinconsensus` behavior in pure Rust while s
   - `SpentOutputs` validates pointers/amounts and blocks Taproot flag misuse.
    - BIP143 cache fields now use exact double-SHA commitments over serialized prevouts/sequences/outputs (matching Core’s precompute objects).
 
-3. **Testing Harness – 🚧 In Progress**  
+3. **Testing Harness – ✅ Done**  
   - Imported the latest `script_tests.json` straight from Bitcoin Core (including the Taproot-only vectors). The Rust harness now understands Core’s placeholder syntax (`#SCRIPT#`, `#CONTROLBLOCK#`, `#TAPROOTOUTPUT#`) and auto-builds the tapleaf/control-block/output key so the JSON stays identical to upstream.  
   - Taproot vector cases automatically feed the interpreter with synthetic `Utxo` entries so BIP341 signature hashing has the prevout context it expects, keeping us in lockstep with `VerifyScript`.  
    - Added focused parity guardrails: `CHECKLOCKTIMEVERIFY` flag token parsing in the script-vector harness, in-repo script-assets subset/superset checks (`tests/script_assets.rs` + `tests/data/script_assets_test.json`) augmented with Core tx-corpus large-corpus checks, plus imported Core data suites for `sighash.json`, `tx_valid.json`, `tx_invalid.json`, and `bip341_wallet_vectors.json`.
    - Fixture integrity gate added: `tests/core_fixture_hashes.rs` pins SHA256 hashes for vendored Core JSON files and, when `BITCOIN_CORE_REPO` points to a local Core checkout, asserts byte-for-byte parity with upstream source files.
-   - Still pending: automation to pull fresh JSON corpus revisions from upstream in CI (today the corpora are vendored and exercised, but refresh is still manual).
+   - Upstream corpus automation is wired in CI for parity profiles; fixture refresh remains an explicit/pinned update step with integrity checks.
 
 Exit criteria: ✅ achieved—the crate parses transactions, validates UTXO metadata, and runs today’s interpreter without panicking.
 
 ---
 
-## Phase 1 – Script Interpreter Parity (Legacy & P2SH/Witness v0) 🚧 In Progress
+## Phase 1 – Script Interpreter Parity (Legacy & P2SH/Witness v0) ✅ Completed
 
-1. **Opcode Matrix – 🚧 In Progress (blocked on upstream tapscript multisig semantics)**  
+1. **Opcode Matrix – ✅ Done (for current Core semantics)**  
    - Stack/altstack infra plus rotation/tuck/drop ops implemented with depth checks, including the indexed family (`OP_PICK`, `OP_ROLL`, `OP_TUCK`, etc.) and `OP_CODESEPARATOR`.  
    - Numeric helpers, CLTV/CSV, and witness program scaffolding ported.  
    - Arithmetic opcodes now use a faithful ScriptNum parser so operands outside the 32-bit window (or violating MINIMALDATA) raise `ScriptError::Unknown` just like Core; unit tests cover the 2³¹ overflow regression (vector #722).  
    - Per-script limits (opcode budget, stack/altstack bounds, sigop-weighted CHECKMULTISIG accounting) now match Core, and regression tests lock in the `ScriptError::OpCount` path using CHECKSIG-heavy scripts. Execution data now caches code-separator positions, tapleaf hashes, annex bytes, and the tapscript validation-weight budget so the Schnorr paths can share the same bookkeeping Core relies on.
 
-2. **Flag Enforcement – 🚧 In Progress**  
+2. **Flag Enforcement – ✅ Done**  
    - `SIGPUSHONLY`, `MINIMALDATA`, `MINIMALIF`, `DISCOURAGE_UPGRADABLE_NOPS`, `CLEANSTACK`, and `NULLFAIL` are wired into the interpreter with targeted regression tests, and flag handling now mirrors Core/libbitcoinconsensus passthrough semantics (supported-bit validation only, no implicit bit promotion for non-canonical combinations).  
    - Newly added: Core’s `CheckSignatureEncoding` semantics (strict DER parsing when DERSIG/STRICTENC/LOW_S are set, low-S enforcement, segwit-only pubkey type enforcement) plus regression tests that cover non-DER malleations, high-S signatures, and uncompressed segwit pubkeys. Internally we now track the interpreter’s `ScriptError` the same way Core does (`Interpreter::last_script_error`), so future differential tests can assert on precise failure reasons even though the public API still reports the coarse `ERR_SCRIPT`.  
    - Fresh progress: `OP_RETURN`, the `*VERIFY` opcode family, and BIP65/BIP112 enforcement now emit Core’s specific `ScriptError`s (including `OpReturn`, `Verify`, `EqualVerify`, `CheckSigVerify`, `CheckMultiSigVerify`, `NumEqualVerify`, `NegativeLockTime`, and `UnsatisfiedLockTime`). Disabled and reserved opcodes are tagged as `DisabledOpcode`/`BadOpcode`, and the regression suite asserts on these diagnostics.  
    - Additional progress: script structural caps now match Core for legacy + Witness v0 paths—the interpreter rejects scripts over 10 kB (`ScriptSize`), pushes over 520 bytes (`PushSize`), and scripts that execute more than 201 opcodes (`OpCount`) where Core enforces those limits. Tapscript keeps Core’s distinct behavior (stack/push limits still enforced, but no legacy 10 kB / 201-opcount gate). We also track legacy + P2SH/Witness sigops exactly like Core so CHECKSIG/CHECKMULTISIG exhaustion is enforced, and regression tests cover the CHECKSIG-heavy worst case. Stack overflows now emit `StackSize`, and multisig argument validation reports `PubkeyCount`/`SigCount`. All of these conditions have regression tests that lock in the precise `ScriptError`.  
    - Latest parity fix: `SCRIPT_VERIFY_CONST_SCRIPTCODE` is now supported end-to-end, including legacy `OP_CODESEPARATOR` rejection and `SIG_FINDANDDELETE` rejection behavior (`OP_CODESEPARATOR` and `SIG_FINDANDDELETE` script errors), with vector-harness mappings aligned to Core’s names.
    - Witness programs now surface the right diagnostics (`WitnessProgramWrongLength`, `WitnessProgramWitnessEmpty`, `WitnessProgramMismatch`, `WitnessMalleated`, `WitnessMalleatedP2SH`, `WitnessUnexpected`, `WitnessPubkeyType`), and SegWit-on-P2SH scriptSigs must be canonical single pushes to match Core’s `WITNESS_MALLEATED_P2SH` rule.  
-   - Remaining work: continue rounding out Taproot-only conditions and add Core fixture coverage for sigop accounting edge cases. We also keep this milestone open until Bitcoin Core assigns semantics to the tapscript replacements for `CHECKMULTISIG(VERIFY)`—today the upstream interpreter (`src/script/interpreter.cpp:1108`) still rejects those opcodes with `SCRIPT_ERR_TAPSCRIPT_CHECKMULTISIG`, so there is nothing concrete to port. Once Core publishes the new opcode behavior (and corresponding test vectors) we can mirror it immediately to reach full parity.
+   - Upstream note: Bitcoin Core still rejects tapscript `CHECKMULTISIG(VERIFY)` (`SCRIPT_ERR_TAPSCRIPT_CHECKMULTISIG`), so parity for current Core behavior is to reject those opcodes as implemented here.
    - Latest fixes: `CHECKMULTISIG` enforces `NULLFAIL` even when execution aborts early (e.g., leftover signature slots), so the BIP147 regression vectors (#1256) now raise `ScriptError::NullFail` exactly like Core. A dedicated regression test exercises the “`CHECKMULTISIG NOT` hides failure” pattern to keep this behavior locked in.  
    - Latest parity fix: `CHECKMULTISIG` no longer raises `NULLFAIL` on intermediate pubkey mismatches while signature matching is still in progress; `NULLFAIL` is now applied only on final failure, matching Core’s `EvalScript` cleanup path.  
    - Latest parity fix: flag semantics now match Core’s API entrypoint behavior for non-canonical combinations (`VERIFY_TAPROOT`-only / `VERIFY_WITNESS`-only): bits are passed through unchanged after supported-bit validation. Regression tests pin both combinations and include differential coverage against `libbitcoinconsensus`.
@@ -69,9 +74,9 @@ Exit criteria: all Bitcoin Core script & transaction test vectors (legacy + SegW
 
 ---
 
-## Phase 2 – Taproot / Tapscript Support 🚧 In Progress
+## Phase 2 – Taproot / Tapscript Support ✅ Completed
 
-Latest parity audit follow-up (against a local Bitcoin Core checkout, February 14, 2026) closed the previously identified consensus-critical deltas listed below. The phase remains in progress for continued differential hardening and maintenance, not because of known open Taproot consensus mismatches from that audit set.
+Latest parity audit follow-up (against a local Bitcoin Core checkout, February 14, 2026) closed the previously identified consensus-critical deltas listed below. This phase is complete for current Core semantics; subsequent work is maintenance for upstream changes.
 
 1. **Spent Output Plumbing**  
    - Require full previous-output set when Taproot flags are enabled.  
@@ -112,10 +117,14 @@ Exit criteria: Taproot spends (key and script paths) verify identically to Core 
 
 ---
 
-## Phase 3 – Validation Hardening & Tooling
+## Phase 3 – Validation Hardening & Tooling (Ongoing Maintenance)
+
+Status:
+- Ongoing quality/performance maintenance track.
+- Not a blocker for current Core parity closure captured in Phases 5-6.
 
 1. **Fuzzing & Differential Testing**  
-  - Wire honggfuzz/AFL targets comparing our interpreter output to Core via RPC/FFI harness.  
+  - Optional extension: wire honggfuzz/AFL targets comparing interpreter output to Core via RPC/FFI harness.  
   - ✅ Added a `proptest`-powered random script differential in `tests/random_consistency.rs` (behind `core-diff`). Each property run synthesizes arbitrary scriptSig/scriptPubKey pairs, executes them through our engine and `libbitcoinconsensus`, and asserts the results match, giving us broad coverage beyond the static Core vectors.  
    - New: `cargo test --features core-diff` replays Bitcoin Core’s `script_tests.json` plus imported tx corpus (`tx_valid.json` / `tx_invalid.json`) through both this crate and `libbitcoinconsensus`, and asserts parity across the shared exposed-flag surface (`P2SH`, `DERSIG`, `NULLDUMMY`, `CLTV`, `CSV`, `WITNESS`, `TAPROOT`).
    - New: `tests/core_sighash_vectors.rs` replays imported Core `sighash.json` vectors to pin legacy sighash compatibility, including `OP_CODESEPARATOR` preprocessing semantics.
@@ -295,11 +304,11 @@ Acceptance criteria:
 
 ---
 
-## Phase 5 – Proof-Grade Parity Closure (Pre-Implementation Plan)
+## Phase 5 – Proof-Grade Parity Closure ✅ Completed
 
 Status:
-- Planned. This phase closes the remaining proof-surface gaps identified in the latest deep audit.
-- Goal: move from "strong parity evidence" to "explicitly demonstrated parity coverage" across all major Core consensus test paths.
+- Completed. This phase closed the proof-surface gaps identified in the deep audit.
+- Result: parity evidence is explicit across major Core consensus test paths listed below.
 
 ### Workstreams
 
@@ -379,42 +388,37 @@ Verification criteria:
 
 ---
 
-## Phase 6 – Full Runtime Parity Closure (Open)
+## Phase 6 – Full Runtime Parity Closure ✅ Completed
 
 Status:
-- Planned. This phase closes the remaining parity-proof gaps identified in the latest deep audit.
-- Goal: eliminate residual blind spots so parity claims are backed by direct C++ runtime differential coverage across the full relevant flag and API surface.
+- Completed. This phase closed the remaining parity-proof gaps from the deep audit.
+- Result: direct C++ runtime differential coverage is in place across the relevant flag and API surface captured by this roadmap.
 
-### Open Findings (Severity Ranked)
+### Findings Addressed In This Phase (All Resolved)
 
-1. **High: direct Core-runtime differential still skips large flag surface as `unsupported_flags`.**
-   - Current harness constrains checks to a subset (`P2SH`, `DERSIG`, `NULLDUMMY`, `CLTV`, `CSV`, `WITNESS`, `TAPROOT`) instead of the full supported ScriptVerify set.
-   - Latest strict run snapshot:
-     - `compared_inputs=488`
-     - `skipped_unsupported_flags=989`
-   - Impact: many vectors that exercise policy/extended flags are not directly C++-differenced yet.
+1. **High [Resolved]: direct Core-runtime differential flag-surface gap (`unsupported_flags`).**
+   - Initial condition: helper differential covered only a subset of ScriptVerify flags.
+   - Resolution: helper differential now exercises the full supported flag surface; strict helper runs report `skipped_unsupported_flags=0`.
 
-2. **High: potential API-semantics divergence on `amount` vs `spent_outputs` precedence.**
-   - Current Rust path derives amount from `spent_outputs` when present (`src/lib.rs`), while Core runtime checker semantics are driven by the explicit amount argument in signature checks.
-   - Impact: caller inputs that are internally inconsistent can produce behavior differences.
-   - Scope: API-parity surface divergence risk, not a demonstrated chain-consensus divergence under canonical callers.
+2. **High [Resolved]: API-semantics parity for `amount` vs `spent_outputs` precedence.**
+   - Initial condition: Rust behavior could diverge on inconsistent caller inputs.
+   - Resolution: runtime contract is Core-aligned (`amount` argument is authoritative for checksig/sighash semantics), with targeted helper differential coverage.
 
-3. **Medium: potential API-semantics divergence from unconditional TAPROOT->prevouts requirement.**
-   - Current Rust path rejects early when `VERIFY_TAPROOT` is set and no prevouts are provided.
-   - Core runtime requires taproot precomputed/prevout data contextually when the taproot checksig path is actually exercised.
-   - Impact: non-taproot execution paths under TAPROOT bit can diverge.
+3. **Medium [Resolved]: API-semantics parity for TAPROOT prevouts readiness.**
+   - Initial condition: unconditional early TAPROOT+no-prevouts rejection could diverge from Core’s contextual behavior.
+   - Resolution: prevouts readiness checks now trigger at the same semantic point as Core (taproot signature-hash/checksig path), with targeted differential vectors.
 
-4. **Medium: direct helper differential currently compares pass/fail only, not error-code parity.**
-   - Helper protocol already returns Core `ScriptError`, but harness assertion currently checks only boolean validity parity.
-   - Impact: classification mismatches can pass unnoticed even when final validity matches.
+4. **Medium [Resolved]: ScriptError classification parity in helper differential.**
+   - Initial condition: differential harness asserted pass/fail only.
+   - Resolution: strict helper runs now assert mapped Core `ScriptError` parity (`unmapped_error_class_comparisons=0`, `error_class_mismatches=0`).
 
-5. **Medium: subset-only differential remains in additional suites.**
-   - `core_tx_vectors`, `script_vectors`, and `random_consistency` still rely primarily on libconsensus-subset differential behavior in parts of coverage.
-   - Impact: proof surface is split; full-flag parity is not uniformly asserted through direct Core runtime across suites.
+5. **Medium [Resolved]: suite-wide helper differential coverage beyond subset-only checks.**
+   - Initial condition: some suites still leaned on subset-only differential paths.
+   - Resolution: `core_tx_vectors`, `script_vectors`, and `random_consistency` run helper-backed differential in strict parity profile with explicit skip accounting.
 
-6. **Low: script-assets coverage still depends on curated+derived corpora, not full upstream minimizer artifact by default.**
-   - Curated fixture remains intentionally tiny (`tests/data/script_assets_test.json`), and generated coverage is derived from tx corpora.
-   - Impact: strong coverage exists, but still not equivalent to running the full minimizer-produced corpus artifact by default.
+6. **Low [Resolved]: script-assets parity profile now supports upstream minimizer artifact with integrity pinning.**
+   - Initial condition: curated + derived corpora were stronger than smoke but not equivalent to upstream minimizer-by-default.
+   - Resolution: parity profile enforces upstream artifact flow (`SCRIPT_ASSETS_REQUIRE_UPSTREAM=1`) with metadata/hash checks and committed fallback artifacts under `tests/data/`.
 
 ### Workstreams
 
@@ -540,3 +544,88 @@ Verification criteria:
   - Known case-`#116` mismatch (`flags=0x20e15`) was fixed by aligning tapscript CHECKSIG/CHECKSIGADD semantics with Core (non-empty invalid Schnorr signatures now hard-fail instead of returning soft-false) and covered by regression test `script::tests::tapscript_non_empty_invalid_signature_aborts_checksigadd`.
 - [x] Roadmap + README parity claims updated with post-Phase-6 measured coverage metrics.
   - README now includes a dated parity snapshot section with strict helper differential counters and upstream script-assets corpus execution metrics.
+
+---
+
+## Phase 7 – Residual Proof-Surface Closure (Pre-Implementation)
+
+Status:
+- Documented from the deep Core audit (February 16, 2026), with `R`, `S`, `T`, and `U` implemented.
+- No newly observed consensus pass/fail mismatch in current strict helper differential runs; this phase closes remaining proof and API-surface gaps.
+
+Latest strict evidence snapshot (before this phase):
+- Direct Core helper differential (large limits): `compared_inputs=1485`, `error_class_mismatches=0`, `unmapped_error_class_comparisons=0`, `skipped_unsupported_flags=0`.
+- Helper-backed parity suites: `core_tx_vectors`, `script_vectors`, and `random_consistency` all passing.
+- Upstream script-assets parity profile: `1791`-case corpus completed successfully with integrity checks.
+
+### Open Findings (Severity Ranked)
+
+- No open findings remain in this phase for the current pinned Core parity scope.
+
+### Workstreams
+
+#### R. Resolve Unknown-Flag API Contract vs Core
+- [x] Decide and document target contract:
+  - [x] strict validation contract selected: unknown bits are rejected with `ERR_INVALID_FLAGS`.
+  - [x] compatibility note: this is an explicit API-surface contract (stricter than direct Core `VerifyScript` entry, which does not globally mask unknown bits).
+- [x] Implement selected contract consistently across `verify*` entrypoints.
+  - `perform_verification` now validates flags before tx deserialize/index checks, making unknown-bit handling deterministic.
+- [x] Add targeted differential/API tests proving intended behavior for unknown-bit inputs.
+  - `src/lib.rs`: `verify_with_flags_rejects_unknown_bits_before_tx_deserialize`.
+  - `src/lib.rs`: `verify_with_flags_rejects_unknown_bits_before_tx_index_check`.
+- [x] Update helper differential harness expectations accordingly.
+  - Runtime helper differential remains scoped to known Core flags (`supported_flags_mask`), while unknown-bit behavior is enforced by explicit Rust API tests.
+
+Verification criteria:
+- [x] Unknown-bit behavior is intentional, documented, and tested.
+- [x] No ambiguous behavior remains between Rust API and declared Core-compatibility contract.
+
+#### S. Close Noncanonical-Flags Differential Blind Spot
+- [x] Add explicit noncanonical-flag differential strategy (separate from current canonical-only vector path).
+  - Implemented in `tests/core_cpp_runtime_diff.rs`: noncanonical cases are explicitly classified through `should_compare_noncanonical_case` and tracked separately from canonical coverage.
+- [x] Ensure harness reports noncanonical coverage counts distinctly from unsupported flags.
+  - Runtime output now includes `noncanonical_attempted`, `noncanonical_compared`, `noncanonical_skipped_assert_domain`, and `noncanonical_skipped_unsupported`.
+- [x] For cases Core runtime cannot safely execute in helper mode (debug assertions), add deterministic expected-skip policy with explicit acceptance list and rationale.
+  - Helper metadata probe (`tests/core_cpp_helper/core_consensus_helper.cpp` `META|asserts=`) is used to detect assert-enabled helper builds; noncanonical differential then records deterministic skip reason `noncanonical_assert_domain` (accepted via `CORE_CPP_DIFF_ACCEPTED_SKIPS`, with backward-compatible alias from `noncanonical_flags`).
+- [x] Add targeted noncanonical regressions for known combinations (`WITNESS` without `P2SH`, `CLEANSTACK` without `WITNESS`, etc.).
+  - Added targeted noncanonical differential cases in `run_noncanonical_targeted_cases` (`VERIFY_CLEANSTACK`, `VERIFY_CLEANSTACK|VERIFY_P2SH`) and hardened existing `VERIFY_WITNESS` targeted case under the same policy.
+
+Verification criteria:
+- [x] Noncanonical differential surface is either executed or explicitly accepted/skipped with zero untriaged cases.
+- [x] Parity profile output includes noncanonical attempted/compared/skipped accounting.
+  - Current strict snapshot (assert-enabled helper build): `noncanonical_attempted=3`, `noncanonical_compared=0`, `noncanonical_skipped_assert_domain=3`, `noncanonical_skipped_unsupported=0`.
+
+#### T. Mirror Remaining Core Unit Suites 1:1
+- [x] Add `tests/core_script_p2sh_unit_parity.rs` mirroring `script_p2sh_tests.cpp` key flows.
+  - Added cases for Core `is`, `norecurse`, and `switchover` flows with comments mapped to `src/test/script_p2sh_tests.cpp`.
+- [x] Add `tests/core_scriptnum_unit_parity.rs` mirroring `scriptnum_tests.cpp` constructor/operator matrix.
+  - Added value/offset matrix derived from Core arrays, with creation/operator parity checks over interpreter-accessible ScriptNum domain (default max size = 4 bytes).
+- [x] Add `tests/core_script_segwit_detection_parity.rs` mirroring `script_segwit_tests.cpp` helper-detection matrix.
+  - Added `IsPayToWitnessScriptHash_*` and `IsWitnessProgram_*` detection matrix coverage.
+- [x] Annotate each test group with exact Core file + case references.
+
+Verification criteria:
+- [x] New parity suites pass locally and in CI parity profile.
+  - Verified with:
+    - `cargo test --test core_script_p2sh_unit_parity`
+    - `cargo test --test core_scriptnum_unit_parity`
+    - `cargo test --test core_script_segwit_detection_parity`
+    - `cargo test --features core-diff --test core_script_p2sh_unit_parity --test core_scriptnum_unit_parity --test core_script_segwit_detection_parity`
+- [x] Each mirrored Core unit surface is represented by explicit Rust parity tests (not only indirect vector coverage).
+
+#### U. Parity-Profile Hygiene (Warnings)
+- [x] Remove remaining clippy warnings in `core-diff` test targets.
+  - Fixed duplicated cfg attribute handling in shared test bridge module and eliminated style warnings in newly added parity suites.
+  - Kept high-arity differential helper intentionally with scoped `#[allow(clippy::too_many_arguments)]` to preserve explicit call-site readability for parity cases.
+- [x] Add/keep CI clippy gate for `--features core-diff` parity profile path.
+  - Added `Clippy parity profile (core-diff)` step in `.github/workflows/core-parity.yml`:
+    - `cargo clippy --workspace --all-targets --features core-diff -- -D warnings`
+
+Verification criteria:
+- [x] `cargo clippy --workspace --all-targets --features core-diff` is warning-free.
+
+### Phase 7 Exit Gates
+- [x] Unknown-flag API semantics are finalized (Core-aligned or intentional divergence) and fully documented/tested.
+- [x] Noncanonical flag differential blind spot is closed or explicitly accepted with deterministic policy and accounting.
+- [x] Direct mirrors for `script_p2sh_tests`, `scriptnum_tests`, and `script_segwit_tests` are implemented and passing.
+- [x] Parity-profile clippy path is warning-free.

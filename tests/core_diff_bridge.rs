@@ -1,5 +1,3 @@
-#![cfg(feature = "core-diff")]
-
 use libloading::Library;
 use std::{
     env,
@@ -296,11 +294,14 @@ impl CoreDiffHarness {
         })?;
 
         let mut configure = Command::new("cmake");
+        let helper_build_type = env::var("CORE_CPP_DIFF_HELPER_BUILD_TYPE")
+            .unwrap_or_else(|_| "RelWithDebInfo".to_string());
         configure
             .arg("-S")
             .arg(&helper_project)
             .arg("-B")
             .arg(&build_dir)
+            .arg(format!("-DCMAKE_BUILD_TYPE={helper_build_type}"))
             .arg(format!("-DBITCOIN_CORE_REPO={}", core_repo.display()));
         Self::run_command(configure, "cmake configure for core helper")?;
 

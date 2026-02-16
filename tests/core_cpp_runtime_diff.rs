@@ -15,8 +15,8 @@ use bitcoin::{
 };
 use consensus::{
     verify_with_flags_detailed, ScriptError, Utxo, VERIFY_CHECKLOCKTIMEVERIFY,
-    VERIFY_CHECKSEQUENCEVERIFY, VERIFY_DERSIG, VERIFY_NULLDUMMY, VERIFY_P2SH, VERIFY_TAPROOT,
-    VERIFY_WITNESS,
+    VERIFY_CHECKSEQUENCEVERIFY, VERIFY_CLEANSTACK, VERIFY_DERSIG, VERIFY_NULLDUMMY, VERIFY_P2SH,
+    VERIFY_TAPROOT, VERIFY_WITNESS,
 };
 use libloading::Library;
 use script_asm::parse_script;
@@ -381,6 +381,10 @@ struct RuntimeDiffStats {
     tx_valid_vectors_compared: usize,
     tx_invalid_vectors_compared: usize,
     targeted_cases_compared: usize,
+    noncanonical_attempted: usize,
+    noncanonical_compared: usize,
+    noncanonical_skipped_assert_domain: usize,
+    noncanonical_skipped_unsupported: usize,
     skipped_noncanonical_flags: usize,
     skipped_unsupported_flags: usize,
     skipped_unknown_tokens: usize,
@@ -437,6 +441,7 @@ struct CoreCppHelperProcess {
     _child: Child,
     stdin: BufWriter<ChildStdin>,
     stdout: BufReader<ChildStdout>,
+    asserts_enabled: bool,
 }
 
 impl CoreCppHarness {
@@ -457,6 +462,20 @@ impl CoreCppHarness {
         match &self.backend {
             CoreCppBackend::LegacyLib(backend) => backend.has_spent_outputs_api,
             CoreCppBackend::Helper(_) => true,
+        }
+    }
+
+    fn helper_asserts_enabled(&self) -> Option<bool> {
+        match &self.backend {
+            CoreCppBackend::LegacyLib(_) => None,
+            CoreCppBackend::Helper(backend) => Some(backend.asserts_enabled),
+        }
+    }
+
+    fn can_compare_noncanonical_directly(&self) -> bool {
+        match &self.backend {
+            CoreCppBackend::LegacyLib(_) => true,
+            CoreCppBackend::Helper(backend) => !backend.asserts_enabled,
         }
     }
 
@@ -555,11 +574,14 @@ impl CoreCppHarness {
         })?;
 
         let mut configure = Command::new("cmake");
+        let helper_build_type = env::var("CORE_CPP_DIFF_HELPER_BUILD_TYPE")
+            .unwrap_or_else(|_| "RelWithDebInfo".to_string());
         configure
             .arg("-S")
             .arg(&helper_project)
             .arg("-B")
             .arg(&build_dir)
+            .arg(format!("-DCMAKE_BUILD_TYPE={helper_build_type}"))
             .arg(format!("-DBITCOIN_CORE_REPO={}", core_repo.display()));
         Self::run_command(configure, "cmake configure for core helper")?;
 
@@ -671,13 +693,17 @@ impl CoreCppHarness {
                 path.display()
             )
         })?;
+        let mut helper = CoreCppHelperProcess {
+            helper_path: path,
+            _child: child,
+            stdin: BufWriter::new(child_stdin),
+            stdout: BufReader::new(child_stdout),
+            asserts_enabled: false,
+        };
+        helper.asserts_enabled = helper.query_asserts_enabled()?;
+
         Ok(Self {
-            backend: CoreCppBackend::Helper(CoreCppHelperProcess {
-                helper_path: path,
-                _child: child,
-                stdin: BufWriter::new(child_stdin),
-                stdout: BufReader::new(child_stdout),
-            }),
+            backend: CoreCppBackend::Helper(helper),
         })
     }
 
@@ -860,6 +886,59 @@ fn bytes_to_hex(data: &[u8]) -> String {
 }
 
 impl CoreCppHelperProcess {
+    fn query_asserts_enabled(&mut self) -> Result<bool, String> {
+        self.stdin.write_all(b"META\n").map_err(|err| {
+            format!(
+                "failed to write helper meta request to {}: {err}",
+                self.helper_path.display()
+            )
+        })?;
+        self.stdin.flush().map_err(|err| {
+            format!(
+                "failed to flush helper meta request to {}: {err}",
+                self.helper_path.display()
+            )
+        })?;
+
+        let mut response = String::new();
+        let bytes_read = self.stdout.read_line(&mut response).map_err(|err| {
+            format!(
+                "failed to read helper meta response from {}: {err}",
+                self.helper_path.display()
+            )
+        })?;
+        if bytes_read == 0 {
+            return Err(format!(
+                "helper {} closed stdout during metadata probe",
+                self.helper_path.display()
+            ));
+        }
+
+        let fields: Vec<&str> = response.trim_end().split('|').collect();
+        if fields.len() != 2 || fields[0] != "META" {
+            return Err(format!(
+                "unexpected helper metadata response from {}: `{}`",
+                self.helper_path.display(),
+                response.trim_end()
+            ));
+        }
+        let value = fields[1].strip_prefix("asserts=").ok_or_else(|| {
+            format!(
+                "missing asserts metadata field in helper response from {}: `{}`",
+                self.helper_path.display(),
+                response.trim_end()
+            )
+        })?;
+        match value {
+            "0" => Ok(false),
+            "1" => Ok(true),
+            other => Err(format!(
+                "invalid asserts metadata value from {}: `{other}`",
+                self.helper_path.display()
+            )),
+        }
+    }
+
     fn verify(
         &mut self,
         script_pubkey: &[u8],
@@ -1274,6 +1353,7 @@ fn local_script_error(result: &Result<(), consensus::ScriptFailure>) -> ScriptEr
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn compare_single_input_case(
     harness: &mut CoreCppHarness,
     stats: &mut RuntimeDiffStats,
@@ -1389,15 +1469,24 @@ fn parse_script_vector_flags(
             return None;
         }
     };
-    if fill_flags(flags) != flags {
-        stats.skipped_noncanonical_flags += 1;
-        return None;
-    }
     if should_skip_for_flags(flags, supported_flags) {
         stats.skipped_unsupported_flags += 1;
         return None;
     }
     Some(flags)
+}
+
+fn should_compare_noncanonical_case(
+    harness: &CoreCppHarness,
+    stats: &mut RuntimeDiffStats,
+) -> bool {
+    stats.noncanonical_attempted += 1;
+    if harness.can_compare_noncanonical_directly() {
+        return true;
+    }
+    stats.skipped_noncanonical_flags += 1;
+    stats.noncanonical_skipped_assert_domain += 1;
+    false
 }
 
 fn run_script_vector_samples(
@@ -1424,7 +1513,7 @@ fn run_script_vector_samples(
         let mut offset = 0usize;
         let mut witness = Witness::new();
         let mut amount_sat = 0u64;
-        if arr.get(0).is_some_and(Value::is_array) {
+        if arr.first().is_some_and(Value::is_array) {
             let Some((w, sats)) = parse_script_vector_witness(&arr[0]) else {
                 stats.skipped_placeholder_vectors += 1;
                 continue;
@@ -1476,6 +1565,10 @@ fn run_script_vector_samples(
         let Some(flags) = parse_script_vector_flags(flags_str, stats, supported_flags) else {
             continue;
         };
+        let noncanonical = fill_flags(flags) != flags;
+        if noncanonical && !should_compare_noncanonical_case(harness, stats) {
+            continue;
+        }
 
         if flags & VERIFY_TAPROOT != 0 && !harness.has_spent_outputs_api() {
             stats.skipped_taproot_without_spent_outputs_support += 1;
@@ -1508,6 +1601,9 @@ fn run_script_vector_samples(
         )?;
         stats.script_vectors_compared += 1;
         stats.compared_inputs += 1;
+        if noncanonical {
+            stats.noncanonical_compared += 1;
+        }
         record_exercised_token_coverage(stats, flags_str);
         record_exercised_flag_coverage(stats, flags);
     }
@@ -1558,21 +1654,19 @@ fn run_tx_vector_samples(
         };
         let direct_flags = if expect_success {
             let included = ALL_TX_VECTOR_FLAGS & !parsed_flags;
-            let projected = included & supported_flags;
-            if fill_flags(projected) != projected {
-                stats.skipped_noncanonical_flags += 1;
-                continue;
-            }
-            projected
+            included & supported_flags
         } else {
-            if fill_flags(parsed_flags) != parsed_flags {
-                stats.skipped_noncanonical_flags += 1;
-                continue;
-            }
             parsed_flags
         };
+        let noncanonical = fill_flags(direct_flags) != direct_flags;
+        if noncanonical && !should_compare_noncanonical_case(harness, stats) {
+            continue;
+        }
         if should_skip_for_flags(direct_flags, supported_flags) {
             stats.skipped_unsupported_flags += 1;
+            if noncanonical {
+                stats.noncanonical_skipped_unsupported += 1;
+            }
             continue;
         }
 
@@ -1679,6 +1773,9 @@ fn run_tx_vector_samples(
         } else {
             stats.tx_invalid_vectors_compared += 1;
         }
+        if noncanonical {
+            stats.noncanonical_compared += 1;
+        }
         record_exercised_token_coverage(stats, flags_str);
         record_exercised_flag_coverage(stats, direct_flags);
     }
@@ -1715,20 +1812,23 @@ fn run_targeted_cases(
         }],
     };
     let tx_bytes = btc_consensus::serialize(&tx);
-    compare_single_input_case(
-        harness,
-        stats,
-        spent_script.as_bytes(),
-        50_000,
-        &tx_bytes,
-        None,
-        0,
-        VERIFY_WITNESS,
-        strict_error_mapping,
-    )?;
-    stats.targeted_cases_compared += 1;
-    stats.compared_inputs += 1;
-    record_exercised_flag_coverage(stats, VERIFY_WITNESS);
+    if should_compare_noncanonical_case(harness, stats) {
+        compare_single_input_case(
+            harness,
+            stats,
+            spent_script.as_bytes(),
+            50_000,
+            &tx_bytes,
+            None,
+            0,
+            VERIFY_WITNESS,
+            strict_error_mapping,
+        )?;
+        stats.targeted_cases_compared += 1;
+        stats.compared_inputs += 1;
+        stats.noncanonical_compared += 1;
+        record_exercised_flag_coverage(stats, VERIFY_WITNESS);
+    }
 
     // Flag-precedence / non-canonical combo edge (TAPROOT-only should not imply WITNESS).
     let tx_flag_edge = Transaction {
@@ -1995,6 +2095,70 @@ fn run_targeted_cases(
     Ok(())
 }
 
+fn run_noncanonical_targeted_cases(
+    harness: &mut CoreCppHarness,
+    stats: &mut RuntimeDiffStats,
+    strict_error_mapping: bool,
+) -> Result<(), String> {
+    // CLEANSTACK without WITNESS or P2SH.
+    let dirty_stack_script =
+        ScriptBuf::from_bytes(vec![all::OP_PUSHNUM_1.to_u8(), all::OP_PUSHNUM_1.to_u8()]);
+    let tx_cleanstack_only = Transaction {
+        version: Version(2),
+        lock_time: LockTime::ZERO,
+        input: vec![TxIn {
+            previous_output: OutPoint::default(),
+            script_sig: ScriptBuf::new(),
+            sequence: Sequence::MAX,
+            witness: Witness::new(),
+        }],
+        output: vec![TxOut {
+            value: bitcoin::Amount::from_sat(0),
+            script_pubkey: ScriptBuf::new(),
+        }],
+    };
+    let tx_cleanstack_only_bytes = btc_consensus::serialize(&tx_cleanstack_only);
+    if should_compare_noncanonical_case(harness, stats) {
+        compare_single_input_case(
+            harness,
+            stats,
+            dirty_stack_script.as_bytes(),
+            0,
+            &tx_cleanstack_only_bytes,
+            None,
+            0,
+            VERIFY_CLEANSTACK,
+            strict_error_mapping,
+        )?;
+        stats.targeted_cases_compared += 1;
+        stats.compared_inputs += 1;
+        stats.noncanonical_compared += 1;
+        record_exercised_flag_coverage(stats, VERIFY_CLEANSTACK);
+    }
+
+    // CLEANSTACK + P2SH without WITNESS.
+    let flags_cleanstack_p2sh = VERIFY_CLEANSTACK | VERIFY_P2SH;
+    if should_compare_noncanonical_case(harness, stats) {
+        compare_single_input_case(
+            harness,
+            stats,
+            dirty_stack_script.as_bytes(),
+            0,
+            &tx_cleanstack_only_bytes,
+            None,
+            0,
+            flags_cleanstack_p2sh,
+            strict_error_mapping,
+        )?;
+        stats.targeted_cases_compared += 1;
+        stats.compared_inputs += 1;
+        stats.noncanonical_compared += 1;
+        record_exercised_flag_coverage(stats, flags_cleanstack_p2sh);
+    }
+
+    Ok(())
+}
+
 #[test]
 fn core_script_error_mapping_table_is_complete() {
     assert_eq!(
@@ -2046,6 +2210,14 @@ fn parse_accepted_skip_reasons() -> BTreeMap<String, ()> {
 fn skip_reason_counts(stats: &RuntimeDiffStats) -> BTreeMap<&'static str, usize> {
     let mut out = BTreeMap::new();
     out.insert("noncanonical_flags", stats.skipped_noncanonical_flags);
+    out.insert(
+        "noncanonical_assert_domain",
+        stats.noncanonical_skipped_assert_domain,
+    );
+    out.insert(
+        "noncanonical_unsupported",
+        stats.noncanonical_skipped_unsupported,
+    );
     out.insert("unsupported_flags", stats.skipped_unsupported_flags);
     out.insert("unknown_tokens", stats.skipped_unknown_tokens);
     out.insert("placeholder_vectors", stats.skipped_placeholder_vectors);
@@ -2121,6 +2293,8 @@ fn core_cpp_runtime_differential_harness() {
     .unwrap_or_else(|err| panic!("tx_invalid runtime diff failed: {err}"));
     run_targeted_cases(&mut harness, &mut stats, strict_error_mapping)
         .unwrap_or_else(|err| panic!("targeted runtime diff failed: {err}"));
+    run_noncanonical_targeted_cases(&mut harness, &mut stats, strict_error_mapping)
+        .unwrap_or_else(|err| panic!("noncanonical targeted runtime diff failed: {err}"));
 
     let total_vectors = stats.script_vectors_compared
         + stats.tx_valid_vectors_compared
@@ -2132,8 +2306,9 @@ fn core_cpp_runtime_differential_harness() {
     );
 
     println!(
-        "core_cpp_runtime_diff: backend={} has_spent_outputs_api={} supported_flags_mask={:#x} compared_inputs={} script_vectors={} tx_valid_vectors={} tx_invalid_vectors={} targeted_cases={} mapped_error_class_comparisons={} unmapped_error_class_comparisons={} error_class_mismatches={} skipped_noncanonical_flags={} skipped_unsupported_flags={} skipped_unknown_tokens={} skipped_placeholder_vectors={} skipped_taproot_no_spent_outputs={} skipped_parse_failures={} skipped_missing_prevouts={}",
+        "core_cpp_runtime_diff: backend={} helper_asserts_enabled={:?} has_spent_outputs_api={} supported_flags_mask={:#x} compared_inputs={} script_vectors={} tx_valid_vectors={} tx_invalid_vectors={} targeted_cases={} noncanonical_attempted={} noncanonical_compared={} noncanonical_skipped_assert_domain={} noncanonical_skipped_unsupported={} mapped_error_class_comparisons={} unmapped_error_class_comparisons={} error_class_mismatches={} skipped_noncanonical_flags={} skipped_unsupported_flags={} skipped_unknown_tokens={} skipped_placeholder_vectors={} skipped_taproot_no_spent_outputs={} skipped_parse_failures={} skipped_missing_prevouts={}",
         harness.backend_label(),
+        harness.helper_asserts_enabled(),
         harness.has_spent_outputs_api(),
         harness.supported_flags_mask(),
         stats.compared_inputs,
@@ -2141,6 +2316,10 @@ fn core_cpp_runtime_differential_harness() {
         stats.tx_valid_vectors_compared,
         stats.tx_invalid_vectors_compared,
         stats.targeted_cases_compared,
+        stats.noncanonical_attempted,
+        stats.noncanonical_compared,
+        stats.noncanonical_skipped_assert_domain,
+        stats.noncanonical_skipped_unsupported,
         stats.mapped_error_class_comparisons,
         stats.unmapped_error_class_comparisons,
         stats.error_class_mismatches,
@@ -2209,6 +2388,17 @@ fn core_cpp_runtime_differential_harness() {
                 stats.compared_inputs,
                 "helper backend should classify every compared input by Core ScriptError mapping coverage",
             );
+            assert_eq!(
+                stats.noncanonical_attempted,
+                stats.noncanonical_compared
+                    + stats.noncanonical_skipped_assert_domain
+                    + stats.noncanonical_skipped_unsupported,
+                "noncanonical differential accounting mismatch: attempted={} compared={} skipped_assert_domain={} skipped_unsupported={}",
+                stats.noncanonical_attempted,
+                stats.noncanonical_compared,
+                stats.noncanonical_skipped_assert_domain,
+                stats.noncanonical_skipped_unsupported
+            );
         }
         let accepted = parse_accepted_skip_reasons();
         let skip_counts = skip_reason_counts(&stats);
@@ -2217,7 +2407,10 @@ fn core_cpp_runtime_differential_harness() {
             if count == 0 {
                 continue;
             }
-            if !accepted.contains_key(reason) {
+            let accepted_reason = accepted.contains_key(reason)
+                || (reason == "noncanonical_assert_domain"
+                    && accepted.contains_key("noncanonical_flags"));
+            if !accepted_reason {
                 unaccepted.push((reason, count));
             }
         }
