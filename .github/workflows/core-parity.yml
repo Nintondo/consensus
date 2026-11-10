@@ -9,7 +9,7 @@ on:
 
 jobs:
   core-parity:
-    runs-on: ubuntu-24.04
+    runs-on: {group: Nintondo, labels: [self-hosted, Linux, X64]}
     timeout-minutes: 120
     env:
       RUST_BACKTRACE: "1"
